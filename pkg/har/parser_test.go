@@ -260,6 +260,29 @@ func TestGetURLsAndMethods(t *testing.T) {
 	assert.Len(t, getEntry.RequestIDs, 2) // Two GET requests
 }
 
+func TestGetURLsAndMethodsRedactsSensitiveQueryValues(t *testing.T) {
+	harData := fmt.Sprintf(`{
+		"log": {
+			"version": "1.2",
+			"creator": {"name": "test-creator", "version": "1.0"},
+			"entries": [{
+				"startedDateTime": "2023-01-01T00:00:00.000Z",
+				"time": 100,
+				"request": {"method": "GET", "url": %q, "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "queryString": [], "headersSize": 150, "bodySize": 0},
+				"response": null
+			}]
+		}
+	}`, "https://example.com/api/data?token=supersecret&id=42")
+	archive := parseTestHAR(t, harData)
+
+	urlMethods := NewParser().GetURLsAndMethods(archive)
+
+	require.Len(t, urlMethods, 1)
+	assert.Contains(t, urlMethods[0].URL, "token=[REDACTED]")
+	assert.NotContains(t, urlMethods[0].URL, "supersecret")
+	assert.Contains(t, urlMethods[0].URL, "id=42")
+}
+
 func TestGetRequestIDsForURLMethod(t *testing.T) {
 	harData := createMultipleEntriesHAR()
 	parser := NewParser()
@@ -515,6 +538,27 @@ func TestGetRequestDetailsPostDataHashPreviewAndFetch(t *testing.T) {
 	assert.Equal(t, body, chunk.Text)
 }
 
+func TestPostDataIndexedAtParseTime(t *testing.T) {
+	parser := NewParser()
+	body := `{"data": "test"}`
+	archive := createPostDataHAR(t, parser, nil, "application/json", body)
+
+	// The postData is in the store from the parse alone — no details call
+	// needed to make it fetchable.
+	sum := sha256.Sum256([]byte(body))
+	ref := fmt.Sprintf("body:%x", sum)
+	chunk, err := parser.GetResponseBody(ref, 0, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, body, chunk.Text)
+
+	// Reads never mutate the store: querying the same archive through a
+	// fresh parser (empty store) yields no hash for its bodies.
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+	require.NoError(t, err)
+	require.NotNil(t, details.Request.PostData)
+	assert.Empty(t, details.Request.PostData.Hash)
+}
+
 func TestGetRequestDetailsTruncatesLargePostDataPreview(t *testing.T) {
 	body := strings.Repeat("a", maxBodyPreview+100)
 	archive := createPostDataHAR(t, NewParser(), nil, "text/plain", body)
@@ -533,10 +577,11 @@ func TestGetRequestDetailsBinaryPostDataMetadataOnly(t *testing.T) {
 	// Backspaces: a control byte that survives %q JSON escaping and fails the
 	// text sniff (postData text is emitted as a plain JSON string, so raw
 	// NUL bytes would render as invalid JSON escapes).
+	parser := NewParser()
 	body := "\b\b\bbinary-garbage"
-	archive := createPostDataHAR(t, NewParser(), nil, "application/octet-stream", body)
+	archive := createPostDataHAR(t, parser, nil, "application/octet-stream", body)
 
-	details, err := NewParser().GetRequestDetails(archive, "request_0")
+	details, err := parser.GetRequestDetails(archive, "request_0")
 
 	require.NoError(t, err)
 	require.NotNil(t, details.Request.PostData)
@@ -595,6 +640,29 @@ func TestGetRequestDetailsInvalidID(t *testing.T) {
 	assert.Contains(t, err.Error(), "request ID out of range")
 }
 
+func TestGetRequestDetailsNilRequestReturnsError(t *testing.T) {
+	harData := `{
+		"log": {
+			"version": "1.2",
+			"creator": {"name": "test-creator", "version": "1.0"},
+			"entries": [{
+				"startedDateTime": "2023-01-01T00:00:00.000Z",
+				"time": 100,
+				"request": null,
+				"response": null
+			}]
+		}
+	}`
+	archive := parseTestHAR(t, harData)
+
+	// A legal-HAR entry with no request must not panic.
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	assert.Error(t, err)
+	assert.Nil(t, details)
+	assert.Contains(t, err.Error(), "has no request data")
+}
+
 func TestRedactAuthHeaders(t *testing.T) {
 	parser := NewParser()
 
@@ -617,6 +685,48 @@ func TestRedactAuthHeaders(t *testing.T) {
 			assert.NotEqual(t, "[REDACTED]", header.Value)
 		case "Authorization", "X-API-Key", "Cookie":
 			assert.Equal(t, "[REDACTED]", header.Value)
+		}
+	}
+}
+
+func TestGetRequestDetailsRedactsCookieValues(t *testing.T) {
+	harData := `{
+		"log": {
+			"version": "1.2",
+			"creator": {"name": "test-creator", "version": "1.0"},
+			"entries": [{
+				"startedDateTime": "2023-01-01T00:00:00.000Z",
+				"time": 100,
+				"request": {"method": "GET", "url": "https://example.com", "httpVersion": "HTTP/1.1",
+					"cookies": [{"name": "session", "value": "secret-session"}, {"name": "JSESSIONID", "value": "sess-abc"}, {"name": "theme", "value": "dark"}],
+					"headers": [], "queryString": [], "headersSize": 150, "bodySize": 0},
+				"response": {"status": 200, "statusText": "OK", "httpVersion": "HTTP/1.1",
+					"cookies": [{"name": "auth_token", "value": "tok-secret"}, {"name": "PHPSESSID", "value": "php-sess"}, {"name": "lang", "value": "en"}],
+					"headers": [], "content": {"size": 0, "mimeType": "text/plain"}, "redirectURL": "", "headersSize": 200, "bodySize": 0}
+			}]
+		}
+	}`
+	archive := parseTestHAR(t, harData)
+
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	// Session-bearing cookies are redacted in both directions; ordinary
+	// cookies keep their values.
+	for _, c := range details.Request.Cookies {
+		switch c.Name {
+		case "session", "JSESSIONID":
+			assert.Equal(t, "[REDACTED]", c.Value)
+		case "theme":
+			assert.Equal(t, "dark", c.Value)
+		}
+	}
+	for _, c := range details.Response.Cookies {
+		switch c.Name {
+		case "auth_token", "PHPSESSID":
+			assert.Equal(t, "[REDACTED]", c.Value)
+		case "lang":
+			assert.Equal(t, "en", c.Value)
 		}
 	}
 }
@@ -963,14 +1073,15 @@ func TestBodyStoreDedupsIdenticalBodies(t *testing.T) {
 	// Identical bodies share one hash reference...
 	assert.Equal(t, first.Response.Content.Hash, second.Response.Content.Hash)
 	// ...and are stored once, not once per entry.
-	assert.Len(t, parser.bodies.bodies, 1)
+	assert.Len(t, parser.bodies.entries, 1)
 }
 
 func TestGetRequestDetailsIncludesBodyHash(t *testing.T) {
+	parser := NewParser()
 	body := `{"ok": true}`
-	archive := createResponseHAR(t, nil, "application/json", body)
+	archive := createResponseHARWithParser(t, parser, nil, "application/json", body)
 
-	details, err := NewParser().GetRequestDetails(archive, "request_0")
+	details, err := parser.GetRequestDetails(archive, "request_0")
 
 	require.NoError(t, err)
 	require.NotNil(t, details.Response.Content)
@@ -1166,6 +1277,23 @@ func TestLoadPolicyExcludedMimeNotStored(t *testing.T) {
 	assert.Nil(t, chunk)
 }
 
+func TestLoadPolicyEmptyMimePatternStoresEverything(t *testing.T) {
+	parser := NewParser()
+	policy := &LoadPolicy{ExcludeMimeTypes: []string{"", "*"}}
+	body := "should be stored"
+	archive := createResponseHARWithPolicy(t, parser, policy, nil, "video/mp4", body)
+
+	details, err := parser.GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Response.Content)
+	// "" and "*" are ignored, not treated as match-everything exclusions.
+	require.NotEmpty(t, details.Response.Content.Hash)
+	chunk, err := parser.GetResponseBody(details.Response.Content.Hash, 0, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, body, chunk.Text)
+}
+
 func TestLoadPolicyMaxKeepBytesNotStored(t *testing.T) {
 	parser := NewParser()
 	policy := &LoadPolicy{MaxKeepBytes: 100}
@@ -1177,7 +1305,7 @@ func TestLoadPolicyMaxKeepBytesNotStored(t *testing.T) {
 	require.NotNil(t, bigDetails.Response.Content)
 	assert.Empty(t, bigDetails.Response.Content.Hash)
 	bigSum := sha256.Sum256([]byte(big))
-	bigRef := fmt.Sprintf("body:%x", bigSum[:8])
+	bigRef := fmt.Sprintf("body:%x", bigSum)
 	_, err = parser.GetResponseBody(bigRef, 0, 4096)
 	assert.EqualError(t, err, "unknown body hash: "+bigRef)
 
@@ -1334,10 +1462,11 @@ func TestGetRequestIDsForURLMethodMatchesRedactedURL(t *testing.T) {
 // Body store reference format tests
 
 func TestBodyHashIsFullSHA256(t *testing.T) {
+	parser := NewParser()
 	body := `{"ok": true}`
-	archive := createResponseHAR(t, nil, "application/json", body)
+	archive := createResponseHARWithParser(t, parser, nil, "application/json", body)
 
-	details, err := NewParser().GetRequestDetails(archive, "request_0")
+	details, err := parser.GetRequestDetails(archive, "request_0")
 
 	require.NoError(t, err)
 	require.NotNil(t, details.Response.Content)

@@ -54,8 +54,14 @@ func (p *LoadPolicy) excludes(mimeType string, size int64) bool {
 	}
 	mimeType = strings.ToLower(strings.SplitN(mimeType, ";", 2)[0])
 	for _, pattern := range p.ExcludeMimeTypes {
-		// "image/*" and "image/" are the same prefix.
-		if strings.HasPrefix(mimeType, strings.ToLower(strings.TrimSuffix(pattern, "*"))) {
+		// "image/*" and "image/" are the same prefix. An empty pattern
+		// ("" or "*") would match every mime type; skip it instead of
+		// silently excluding all bodies.
+		prefix := strings.ToLower(strings.TrimSuffix(pattern, "*"))
+		if prefix == "" {
+			continue
+		}
+		if strings.HasPrefix(mimeType, prefix) {
 			return true
 		}
 	}
@@ -129,7 +135,7 @@ func (p *Parser) ParseWithPolicy(r io.Reader, policy *LoadPolicy) (*har.HAR, err
 		// longer fetchable.
 		p.policy = policy
 		p.bodies = NewBodyStore()
-		p.indexResponseBodies(&harData)
+		p.indexBodies(&harData)
 		return &harData, nil
 	}
 
@@ -144,23 +150,32 @@ func (p *Parser) ParseWithPolicy(r io.Reader, policy *LoadPolicy) (*har.HAR, err
 	standardHAR := flexibleHAR.ToStandardHAR()
 	p.policy = policy
 	p.bodies = NewBodyStore()
-	p.indexResponseBodies(standardHAR)
+	p.indexBodies(standardHAR)
 	return standardHAR, nil
 }
 
-// indexResponseBodies stores every non-empty decoded response body allowed
-// by the load policy in the body store, deduplicated by content hash. This
-// is the single choke point where bodies enter the store at parse time,
-// covering both the standard decode and the FlexibleHAR fallback.
-func (p *Parser) indexResponseBodies(harData *har.HAR) {
+// indexBodies stores every non-empty decoded response body and request
+// postData allowed by the load policy in the body store, deduplicated by
+// content hash. This is the single choke point where bodies enter the store,
+// at parse time, covering both the standard decode and the FlexibleHAR
+// fallback. Response bodies are indexed before postData within an entry, so
+// when identical bytes appear in both, the response's mime type wins the
+// first-store record. Reads never mutate the store: they look references up
+// via BodyStore.Ref.
+func (p *Parser) indexBodies(harData *har.HAR) {
 	for _, entry := range harData.Log.Entries {
-		if entry.Response == nil || entry.Response.Content == nil {
-			continue
+		if entry.Response != nil && entry.Response.Content != nil {
+			content := entry.Response.Content
+			if p.shouldStore(content.MimeType, int64(len(content.Text))) {
+				p.bodies.Add(content.Text, content.MimeType)
+			}
 		}
-		if !p.shouldStore(entry.Response.Content.MimeType, int64(len(entry.Response.Content.Text))) {
-			continue
+		if entry.Request != nil && entry.Request.PostData != nil {
+			pd := entry.Request.PostData
+			if p.shouldStore(pd.MimeType, int64(len(pd.Text))) {
+				p.bodies.Add([]byte(pd.Text), pd.MimeType)
+			}
 		}
-		p.bodies.Add(entry.Response.Content.Text, entry.Response.Content.MimeType)
 	}
 }
 
@@ -171,7 +186,9 @@ type URLMethodEntry struct {
 	RequestIDs []string `json:"request_ids"`
 }
 
-// GetURLsAndMethods returns all unique URL and method combinations from the HAR
+// GetURLsAndMethods returns all unique URL and method combinations from the
+// HAR. URLs are normalized (fragment stripped, sensitive query values
+// redacted), matching the form shown by list_entries and get_request_details.
 func (p *Parser) GetURLsAndMethods(harData *har.HAR) []URLMethodEntry {
 	// Map to store unique URL+Method combinations and their request IDs
 	urlMethodMap := make(map[string]*URLMethodEntry)
@@ -181,14 +198,15 @@ func (p *Parser) GetURLsAndMethods(harData *har.HAR) []URLMethodEntry {
 			continue
 		}
 
-		key := fmt.Sprintf("%s|%s", entry.Request.URL, entry.Request.Method)
+		url := normalizeURL(entry.Request.URL)
+		key := fmt.Sprintf("%s|%s", url, entry.Request.Method)
 		requestID := fmt.Sprintf("request_%d", i)
 
 		if existing, ok := urlMethodMap[key]; ok {
 			existing.RequestIDs = append(existing.RequestIDs, requestID)
 		} else {
 			urlMethodMap[key] = &URLMethodEntry{
-				URL:        entry.Request.URL,
+				URL:        url,
 				Method:     entry.Request.Method,
 				RequestIDs: []string{requestID},
 			}
@@ -215,7 +233,10 @@ func (p *Parser) GetRequestIDsForURLMethod(harData *har.HAR, targetURL, method s
 
 		// Match on normalized URLs (fragment stripped, sensitive query
 		// values redacted) so the form an agent copies from list_entries or
-		// get_request_details round-trips into this query.
+		// get_request_details round-trips into this query. A known tradeoff:
+		// requests that differ only by a sensitive query value (e.g.
+		// ?token=A vs ?token=B) normalize to the same form and collapse into
+		// one match set.
 		if normalizeURL(entry.Request.URL) == normalizeURL(targetURL) && entry.Request.Method == method {
 			requestID := fmt.Sprintf("request_%d", i)
 			requestIDs = append(requestIDs, requestID)
@@ -285,12 +306,10 @@ func (p *Parser) GetEntries(harData *har.HAR, filter, method string, offset, lim
 			if entry.Response.Content != nil {
 				row.MimeType = entry.Response.Content.MimeType
 				row.Size = entry.Response.Content.Size
-				// Add is idempotent: bodies were already indexed at parse
-				// time. Bodies the load policy excluded must not sneak in
-				// through a read, so the same policy check applies here.
-				if p.shouldStore(entry.Response.Content.MimeType, int64(len(entry.Response.Content.Text))) {
-					row.BodyHash = p.bodies.Add(entry.Response.Content.Text, entry.Response.Content.MimeType)
-				}
+				// Lookup-only: bodies were indexed at parse time under the
+				// load policy, so a body absent from the store was excluded
+				// and gets no hash. Reads never mutate the store.
+				row.BodyHash = p.bodies.Ref(entry.Response.Content.Text)
 			}
 		}
 		matches = append(matches, row)
@@ -369,6 +388,29 @@ func redactQueryString(qs []har.QueryString) []har.QueryString {
 	for i, q := range qs {
 		out[i] = q
 		if sensitiveQueryKeys[strings.ToLower(q.Name)] {
+			out[i].Value = "[REDACTED]"
+		}
+	}
+	return out
+}
+
+// redactCookies redacts the values of cookies whose names indicate auth
+// material, so the cookies field does not leak what header redaction already
+// hides (Set-Cookie / Cookie are redacted wholesale). A cookie counts as
+// sensitive when its name matches a sensitiveQueryKeys entry or contains
+// "session", "sessid", "token", or "auth" — covering session=, JSESSIONID,
+// PHPSESSID, auth_token, and friends. Ordinary cookies (theme, lang, ...)
+// keep their values; the cookie name itself is never a secret.
+func redactCookies(cookies []har.Cookie) []har.Cookie {
+	out := make([]har.Cookie, len(cookies))
+	for i, c := range cookies {
+		out[i] = c
+		name := strings.ToLower(c.Name)
+		if sensitiveQueryKeys[name] ||
+			strings.Contains(name, "session") ||
+			strings.Contains(name, "sessid") ||
+			strings.Contains(name, "token") ||
+			strings.Contains(name, "auth") {
 			out[i].Value = "[REDACTED]"
 		}
 	}
@@ -486,12 +528,18 @@ func (p *Parser) GetRequestDetails(harData *har.HAR, requestID string) (*Request
 
 	entry := harData.Log.Entries[index]
 
-	// Create request info with redacted headers and query values
+	// Entries with a nil Request are legal HAR (get_request_ids skips them)
+	// but have no details to show.
+	if entry.Request == nil {
+		return nil, fmt.Errorf("request ID has no request data: %s", requestID)
+	}
+
+	// Create request info with redacted headers, cookie values, and query values
 	requestInfo := &RequestInfo{
 		Method:      entry.Request.Method,
 		URL:         normalizeURL(entry.Request.URL),
 		HTTPVersion: entry.Request.HTTPVersion,
-		Cookies:     entry.Request.Cookies,
+		Cookies:     redactCookies(entry.Request.Cookies),
 		Headers:     p.redactAuthHeaders(entry.Request.Headers),
 		QueryString: redactQueryString(entry.Request.QueryString),
 		PostData:    p.buildPostDataInfo(entry.Request.PostData),
@@ -523,7 +571,7 @@ func (p *Parser) buildResponseInfo(resp *har.Response) *ResponseInfo {
 		Status:      resp.Status,
 		StatusText:  resp.StatusText,
 		HTTPVersion: resp.HTTPVersion,
-		Cookies:     resp.Cookies,
+		Cookies:     redactCookies(resp.Cookies),
 		Headers:     p.redactAuthHeaders(resp.Headers),
 		RedirectURL: resp.RedirectURL,
 		HeadersSize: resp.HeadersSize,
@@ -536,12 +584,10 @@ func (p *Parser) buildResponseInfo(resp *har.Response) *ResponseInfo {
 			MimeType: resp.Content.MimeType,
 			Encoding: resp.Content.Encoding,
 		}
-		// Add is idempotent: bodies already indexed at parse time are
-		// returned by reference without re-storing. Bodies the load policy
-		// excluded get no hash, so get_response_body cannot fetch them.
-		if p.shouldStore(resp.Content.MimeType, int64(len(resp.Content.Text))) {
-			info.Content.Hash = p.bodies.Add(resp.Content.Text, resp.Content.MimeType)
-		}
+		// Lookup-only: bodies were indexed at parse time under the load
+		// policy. Bodies the policy excluded are absent from the store and
+		// get no hash, so get_response_body cannot fetch them.
+		info.Content.Hash = p.bodies.Ref(resp.Content.Text)
 		if bodyReadable(resp.Content.MimeType, resp.Content.Text) && len(resp.Content.Text) > 0 {
 			preview := string(resp.Content.Text)
 			if len(preview) > maxBodyPreview {
@@ -569,11 +615,9 @@ func (p *Parser) buildPostDataInfo(pd *har.PostData) *PostDataInfo {
 		Params:   pd.Params,
 		Size:     int64(len(pd.Text)),
 	}
-	// Same policy gate as response bodies: excluded post data gets no hash,
-	// so get_response_body cannot fetch it.
-	if p.shouldStore(pd.MimeType, int64(len(pd.Text))) {
-		info.Hash = p.bodies.Add([]byte(pd.Text), pd.MimeType)
-	}
+	// Lookup-only: postData was indexed at parse time under the load
+	// policy, so an excluded body is absent from the store and gets no hash.
+	info.Hash = p.bodies.Ref([]byte(pd.Text))
 	if bodyReadable(pd.MimeType, []byte(pd.Text)) && len(pd.Text) > 0 {
 		preview := pd.Text
 		if len(preview) > maxBodyPreview {

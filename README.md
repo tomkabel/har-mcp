@@ -116,12 +116,14 @@ Load a HAR file from a file path or HTTP URL.
 
 #### 2. `list_entries`
 List all HAR entries as one compact row each — method, status, mime type, size,
-timing, and body hash. Query params are stripped from URLs; use
-`get_request_details` for the full URL. This is the primary index: call this
-first, then `get_request_details`, then `get_response_body`.
+timing, and body hash. Query params are kept — they discriminate requests —
+but values for sensitive keys are redacted, and URLs are capped at 100 chars;
+use `get_request_details` for the full URL. This is the primary index: call
+this first, then `get_request_details`, then `get_response_body`.
 
 **Parameters:**
-- `filter` (string, optional): Substring match on the request URL path (query params are stripped from displayed URLs)
+- `filter` (string, optional): Case-insensitive substring match on the
+  normalized request URL (query params included, sensitive values redacted)
 - `method` (string, optional): The HTTP method to filter by (GET, POST, etc.)
 - `offset` (number, optional, default 0): Row offset into the matching entries
 - `limit` (number, optional, default 200, max 1000): Maximum number of rows to return
@@ -136,6 +138,7 @@ Get all request IDs for a specific URL and HTTP method.
 - `method` (string, required): The HTTP method to filter by (GET, POST, etc.)
 
 **Example:**
+
 ```json
 {
   "url": "https://api.example.com/users",
@@ -150,6 +153,7 @@ Get full request details by request ID. Authentication headers will be automatic
 - `request_id` (string, required): The request ID to retrieve details for
 
 **Example:**
+
 ```json
 {
   "request_id": "request_0"
@@ -175,9 +179,10 @@ between `offset` and `offset + limit`; binary bodies return metadata only.
 - `limit` (number, optional, default 4096): Maximum number of bytes to return (max 65536)
 
 **Example:**
+
 ```json
 {
-  "hash": "body:3f2a1c9d8e7b6a5f",
+  "hash": "body:3f2a1c9d8e7b6a5f4c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c",
   "offset": 0,
   "limit": 4096
 }
