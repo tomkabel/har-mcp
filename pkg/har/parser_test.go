@@ -391,6 +391,58 @@ func createResponseHARWithPolicy(t *testing.T, parser *Parser, policy *LoadPolic
 	return archive
 }
 
+// createPostDataHAR creates a HAR with a single entry whose request carries
+// the given postData mime type and body, parsed with the given parser under
+// the given load policy. Post data text is emitted as a plain JSON string
+// (no base64), matching how martian parses request bodies.
+func createPostDataHAR(t *testing.T, parser *Parser, policy *LoadPolicy, mimeType, body string) *har.HAR {
+	t.Helper()
+
+	harData := fmt.Sprintf(`{
+		"log": {
+			"version": "1.2",
+			"creator": {"name": "test-creator", "version": "1.0"},
+			"entries": [
+				{
+					"startedDateTime": "2023-01-01T00:00:00.000Z",
+					"time": 100,
+					"request": {
+						"method": "POST",
+						"url": "https://example.com",
+						"httpVersion": "HTTP/1.1",
+						"cookies": [],
+						"headers": [],
+						"queryString": [],
+						"postData": {
+							"mimeType": %q,
+							"text": %q
+						},
+						"headersSize": 150,
+						"bodySize": %d
+					},
+					"response": {
+						"status": 200,
+						"statusText": "OK",
+						"httpVersion": "HTTP/1.1",
+						"cookies": [],
+						"headers": [],
+						"content": {"size": 0, "mimeType": "text/plain"},
+						"redirectURL": "",
+						"headersSize": 200,
+						"bodySize": 0
+					}
+				}
+			]
+		}
+	}`, mimeType, body, len(body))
+
+	archive, err := parser.ParseWithPolicy(strings.NewReader(harData), policy)
+	require.NoError(t, err, "failed to parse test HAR data")
+	require.NotNil(t, archive, "parsed archive should not be nil")
+
+	return archive
+}
+
 func TestGetRequestDetailsRedactsResponseHeaders(t *testing.T) {
 	archive := createResponseHAR(t, []har.Header{
 		{Name: "Content-Type", Value: "text/html"},
@@ -434,6 +486,85 @@ func TestGetRequestDetailsBinaryBodyMetadataOnly(t *testing.T) {
 	assert.Empty(t, details.Response.Content.TextPreview)
 	assert.False(t, details.Response.Content.Truncated)
 	assert.Equal(t, "video/mp4", details.Response.Content.MimeType)
+}
+
+func TestGetRequestDetailsPostDataHashPreviewAndFetch(t *testing.T) {
+	parser := NewParser()
+	body := `{"data": "test"}`
+	archive := createPostDataHAR(t, parser, nil, "application/json", body)
+
+	details, err := parser.GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Request.PostData)
+	assert.Equal(t, "application/json", details.Request.PostData.MimeType)
+	assert.Equal(t, int64(len(body)), details.Request.PostData.Size)
+	sum := sha256.Sum256([]byte(body))
+	assert.Equal(t, fmt.Sprintf("body:%x", sum[:8]), details.Request.PostData.Hash)
+	assert.Equal(t, body, details.Request.PostData.TextPreview)
+	assert.False(t, details.Request.PostData.Truncated)
+
+	// The request body is fetchable chunked from the same body store.
+	chunk, err := parser.GetResponseBody(details.Request.PostData.Hash, 0, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, body, chunk.Text)
+}
+
+func TestGetRequestDetailsTruncatesLargePostDataPreview(t *testing.T) {
+	body := strings.Repeat("a", maxBodyPreview+100)
+	archive := createPostDataHAR(t, NewParser(), nil, "text/plain", body)
+
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Request.PostData)
+	assert.True(t, details.Request.PostData.Truncated)
+	assert.Equal(t, maxBodyPreview, len(details.Request.PostData.TextPreview))
+	assert.Equal(t, int64(len(body)), details.Request.PostData.Size)
+}
+
+func TestGetRequestDetailsBinaryPostDataMetadataOnly(t *testing.T) {
+	archive := createPostDataHAR(t, NewParser(), nil, "application/octet-stream", "binary-garbage")
+
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Request.PostData)
+	require.NotEmpty(t, details.Request.PostData.Hash)
+	assert.Empty(t, details.Request.PostData.TextPreview)
+	assert.False(t, details.Request.PostData.Truncated)
+	assert.Equal(t, int64(len("binary-garbage")), details.Request.PostData.Size)
+}
+
+func TestLoadPolicyExcludedPostDataNotStored(t *testing.T) {
+	parser := NewParser()
+	policy := &LoadPolicy{ExcludeMimeTypes: []string{"multipart/"}}
+	body := "some multipart payload"
+	archive := createPostDataHAR(t, parser, policy, "multipart/form-data", body)
+
+	details, err := parser.GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Request.PostData)
+	assert.Empty(t, details.Request.PostData.Hash)
+
+	sum := sha256.Sum256([]byte(body))
+	ref := fmt.Sprintf("body:%x", sum[:8])
+	chunk, err := parser.GetResponseBody(ref, 0, 4096)
+	assert.EqualError(t, err, "unknown body hash: "+ref)
+	assert.Nil(t, chunk)
+}
+
+func TestGetRequestDetailsFormUrlencodedPostDataPreview(t *testing.T) {
+	body := "a=1&b=2&name=har-mcp"
+	archive := createPostDataHAR(t, NewParser(), nil, "application/x-www-form-urlencoded", body)
+
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Request.PostData)
+	assert.Equal(t, body, details.Request.PostData.TextPreview)
+	assert.False(t, details.Request.PostData.Truncated)
 }
 
 func TestGetRequestDetailsInvalidID(t *testing.T) {

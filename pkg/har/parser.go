@@ -354,12 +354,28 @@ type ContentInfo struct {
 	Truncated   bool   `json:"truncated,omitempty"`
 }
 
+// PostDataInfo is request post data with a bounded text preview. Binary
+// uploads carry metadata only — an LLM cannot read them, so shipping even a
+// preview is token waste. Hash is the body-store reference for the full
+// post data, fetched on demand via get_response_body. Without this bound a
+// large POST body (file upload, big form) would dump fully into the agent
+// context on a single get_request_details call.
+type PostDataInfo struct {
+	MimeType    string      `json:"mimeType"`
+	Params      []har.Param `json:"params,omitempty"`
+	Size        int64       `json:"size"`
+	Hash        string      `json:"hash,omitempty"`
+	TextPreview string      `json:"textPreview,omitempty"`
+	Truncated   bool        `json:"truncated,omitempty"`
+}
+
 // maxBodyPreview is the maximum number of body bytes included in a ContentInfo
 // preview. This is what keeps get_request_details bounded regardless of the
 // captured response size.
 const maxBodyPreview = 4096
 
-// RequestInfo is like har.Request but with redacted auth headers
+// RequestInfo is like har.Request but with redacted auth headers and a
+// bounded post-data preview instead of the raw body
 type RequestInfo struct {
 	Method      string            `json:"method"`
 	URL         string            `json:"url"`
@@ -367,7 +383,7 @@ type RequestInfo struct {
 	Cookies     []har.Cookie      `json:"cookies"`
 	Headers     []har.Header      `json:"headers"`
 	QueryString []har.QueryString `json:"queryString"`
-	PostData    *har.PostData     `json:"postData,omitempty"`
+	PostData    *PostDataInfo     `json:"postData,omitempty"`
 	HeadersSize int64             `json:"headersSize"`
 	BodySize    int64             `json:"bodySize"`
 }
@@ -394,7 +410,7 @@ func (p *Parser) GetRequestDetails(harData *har.HAR, requestID string) (*Request
 		Cookies:     entry.Request.Cookies,
 		Headers:     p.redactAuthHeaders(entry.Request.Headers),
 		QueryString: entry.Request.QueryString,
-		PostData:    entry.Request.PostData,
+		PostData:    p.buildPostDataInfo(entry.Request.PostData),
 		HeadersSize: entry.Request.HeadersSize,
 		BodySize:    entry.Request.BodySize,
 	}
@@ -455,6 +471,37 @@ func (p *Parser) buildResponseInfo(resp *har.Response) *ResponseInfo {
 	return info
 }
 
+// buildPostDataInfo converts a har.PostData into a PostDataInfo with a
+// bounded text preview instead of the raw body. postData.Text is used as-is
+// (no base64 decoding): martian stores binary uploads as their base64 JSON
+// form, which is fine — the hash is deterministic and dedup still works.
+func (p *Parser) buildPostDataInfo(pd *har.PostData) *PostDataInfo {
+	if pd == nil {
+		return nil
+	}
+
+	info := &PostDataInfo{
+		MimeType: pd.MimeType,
+		Params:   pd.Params,
+		Size:     int64(len(pd.Text)),
+	}
+	// Same policy gate as response bodies: excluded post data gets no hash,
+	// so get_response_body cannot fetch it.
+	if p.shouldStore(pd.MimeType, int64(len(pd.Text))) {
+		info.Hash = p.bodies.Add([]byte(pd.Text), pd.MimeType)
+	}
+	if isTextMime(pd.MimeType) && len(pd.Text) > 0 {
+		preview := pd.Text
+		if len(preview) > maxBodyPreview {
+			preview = preview[:maxBodyPreview]
+			info.Truncated = true
+		}
+		info.TextPreview = preview
+	}
+
+	return info
+}
+
 // isTextMime reports whether a mime type is likely to carry LLM-readable text.
 // Binary mimes (video/*, image/*, font/*, ...) get metadata only.
 func isTextMime(mime string) bool {
@@ -464,6 +511,7 @@ func isTextMime(mime string) bool {
 		mime == "application/xml" ||
 		mime == "application/javascript" ||
 		mime == "application/x-javascript" ||
+		mime == "application/x-www-form-urlencoded" ||
 		strings.HasSuffix(mime, "+json") ||
 		strings.HasSuffix(mime, "+xml")
 }

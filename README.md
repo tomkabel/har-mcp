@@ -183,6 +183,18 @@ between `offset` and `offset + limit`; binary bodies return metadata only.
 }
 ```
 
+## Client-side usage
+
+- **Never attach a .har file raw to an agent context** (e.g. `@ capture.har`):
+  a 5.7MB capture is roughly 1.4M tokens. The MCP tools are the only
+  supported ingestion path: `load_har` -> `list_entries` ->
+  `get_request_details` -> `get_response_body`.
+- No MCP server available? Pre-trim the file with jq — strip all response
+  bodies and postData text while keeping headers/status:
+  `jq 'del(.log.entries[].response.content.text, .log.entries[].request.postData.text)' capture.har > trimmed.har`
+- Or keep small bodies and only drop responses over 16KB:
+  `jq '(.log.entries[] | select(.response.content.size > 16384) | .response.content.text) = null' capture.har > trimmed.har`
+
 ## Integration with Claude Desktop
 
 Add the following to your Claude Desktop configuration:
