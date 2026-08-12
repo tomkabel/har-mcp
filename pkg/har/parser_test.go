@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/martian/har"
 	"github.com/stretchr/testify/assert"
@@ -477,7 +478,8 @@ func TestGetRequestDetailsTruncatesLargeBodyPreview(t *testing.T) {
 }
 
 func TestGetRequestDetailsBinaryBodyMetadataOnly(t *testing.T) {
-	archive := createResponseHAR(t, nil, "video/mp4", "binary-garbage")
+	body := "\x00\x01\x02\x03binary-garbage" // NUL bytes: never looks like text
+	archive := createResponseHAR(t, nil, "video/mp4", body)
 
 	details, err := NewParser().GetRequestDetails(archive, "request_0")
 
@@ -500,7 +502,7 @@ func TestGetRequestDetailsPostDataHashPreviewAndFetch(t *testing.T) {
 	assert.Equal(t, "application/json", details.Request.PostData.MimeType)
 	assert.Equal(t, int64(len(body)), details.Request.PostData.Size)
 	sum := sha256.Sum256([]byte(body))
-	assert.Equal(t, fmt.Sprintf("body:%x", sum[:8]), details.Request.PostData.Hash)
+	assert.Equal(t, fmt.Sprintf("body:%x", sum), details.Request.PostData.Hash)
 	assert.Equal(t, body, details.Request.PostData.TextPreview)
 	assert.False(t, details.Request.PostData.Truncated)
 
@@ -524,7 +526,11 @@ func TestGetRequestDetailsTruncatesLargePostDataPreview(t *testing.T) {
 }
 
 func TestGetRequestDetailsBinaryPostDataMetadataOnly(t *testing.T) {
-	archive := createPostDataHAR(t, NewParser(), nil, "application/octet-stream", "binary-garbage")
+	// Backspaces: a control byte that survives %q JSON escaping and fails the
+	// text sniff (postData text is emitted as a plain JSON string, so raw
+	// NUL bytes would render as invalid JSON escapes).
+	body := "\b\b\bbinary-garbage"
+	archive := createPostDataHAR(t, NewParser(), nil, "application/octet-stream", body)
 
 	details, err := NewParser().GetRequestDetails(archive, "request_0")
 
@@ -533,7 +539,7 @@ func TestGetRequestDetailsBinaryPostDataMetadataOnly(t *testing.T) {
 	require.NotEmpty(t, details.Request.PostData.Hash)
 	assert.Empty(t, details.Request.PostData.TextPreview)
 	assert.False(t, details.Request.PostData.Truncated)
-	assert.Equal(t, int64(len("binary-garbage")), details.Request.PostData.Size)
+	assert.Equal(t, int64(len(body)), details.Request.PostData.Size)
 }
 
 func TestLoadPolicyExcludedPostDataNotStored(t *testing.T) {
@@ -549,7 +555,7 @@ func TestLoadPolicyExcludedPostDataNotStored(t *testing.T) {
 	assert.Empty(t, details.Request.PostData.Hash)
 
 	sum := sha256.Sum256([]byte(body))
-	ref := fmt.Sprintf("body:%x", sum[:8])
+	ref := fmt.Sprintf("body:%x", sum)
 	chunk, err := parser.GetResponseBody(ref, 0, 4096)
 	assert.EqualError(t, err, "unknown body hash: "+ref)
 	assert.Nil(t, chunk)
@@ -965,7 +971,7 @@ func TestGetRequestDetailsIncludesBodyHash(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, details.Response.Content)
 	sum := sha256.Sum256([]byte(body))
-	assert.Equal(t, fmt.Sprintf("body:%x", sum[:8]), details.Response.Content.Hash)
+	assert.Equal(t, fmt.Sprintf("body:%x", sum), details.Response.Content.Hash)
 }
 
 func TestGetResponseBodyChunking(t *testing.T) {
@@ -1022,7 +1028,8 @@ func TestGetResponseBodyClampsBounds(t *testing.T) {
 
 func TestGetResponseBodyBinaryMetadataOnly(t *testing.T) {
 	parser := NewParser()
-	archive := createResponseHARWithParser(t, parser, nil, "video/mp4", "binary-garbage")
+	body := "\x00\x01\x02\x03binary-garbage" // NUL bytes: never looks like text
+	archive := createResponseHARWithParser(t, parser, nil, "video/mp4", body)
 	require.NotNil(t, archive)
 
 	details, err := parser.GetRequestDetails(archive, "request_0")
@@ -1031,7 +1038,7 @@ func TestGetResponseBodyBinaryMetadataOnly(t *testing.T) {
 
 	chunk, err := parser.GetResponseBody(details.Response.Content.Hash, 0, 4096)
 	require.NoError(t, err)
-	assert.Equal(t, int64(len("binary-garbage")), chunk.TotalSize)
+	assert.Equal(t, int64(len(body)), chunk.TotalSize)
 	assert.Equal(t, "video/mp4", chunk.MimeType)
 	assert.Empty(t, chunk.Text)
 	assert.NotEmpty(t, chunk.Note)
@@ -1039,7 +1046,7 @@ func TestGetResponseBodyBinaryMetadataOnly(t *testing.T) {
 }
 
 func TestGetResponseBodyUnknownHash(t *testing.T) {
-	chunk, err := NewParser().GetResponseBody("body:0000000000000000", 0, 4096)
+	chunk, err := NewParser().GetResponseBody("body:"+strings.Repeat("0", 64), 0, 4096)
 	assert.Error(t, err)
 	assert.Nil(t, chunk)
 	assert.Contains(t, err.Error(), "unknown body hash")
@@ -1047,7 +1054,7 @@ func TestGetResponseBodyUnknownHash(t *testing.T) {
 
 // GetEntries tests
 
-func TestGetEntriesStripsQueryParams(t *testing.T) {
+func TestGetEntriesKeepsQueryParams(t *testing.T) {
 	harData := `{
 		"log": {
 			"version": "1.2",
@@ -1058,6 +1065,18 @@ func TestGetEntriesStripsQueryParams(t *testing.T) {
 					"time": 100,
 					"request": {"method": "GET", "url": "https://example.com/_next/static/chunks/4051.8ef8f2c36aab35cf.js?dpl=dpl_3Jw8vhcQQWEZCvVexEep", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "queryString": [], "headersSize": 150, "bodySize": 0},
 					"response": {"status": 200, "statusText": "OK", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "content": {"size": 11, "mimeType": "application/javascript"}, "redirectURL": "", "headersSize": 200, "bodySize": 11}
+				},
+				{
+					"startedDateTime": "2023-01-01T00:00:01.000Z",
+					"time": 100,
+					"request": {"method": "GET", "url": "https://example.com/api/resource?id=1", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "queryString": [], "headersSize": 150, "bodySize": 0},
+					"response": {"status": 200, "statusText": "OK", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "content": {"size": 11, "mimeType": "application/json"}, "redirectURL": "", "headersSize": 200, "bodySize": 11}
+				},
+				{
+					"startedDateTime": "2023-01-01T00:00:02.000Z",
+					"time": 100,
+					"request": {"method": "GET", "url": "https://example.com/api/resource?id=2", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "queryString": [], "headersSize": 150, "bodySize": 0},
+					"response": {"status": 200, "statusText": "OK", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "content": {"size": 11, "mimeType": "application/json"}, "redirectURL": "", "headersSize": 200, "bodySize": 11}
 				}
 			]
 		}
@@ -1066,10 +1085,14 @@ func TestGetEntriesStripsQueryParams(t *testing.T) {
 
 	entries, total := NewParser().GetEntries(archive, "", "", 0, 10)
 
-	assert.Equal(t, 1, total)
-	require.Len(t, entries, 1)
-	assert.Equal(t, "https://example.com/_next/static/chunks/4051.8ef8f2c36aab35cf.js", entries[0].URL)
-	assert.NotContains(t, entries[0].URL, "dpl=")
+	assert.Equal(t, 3, total)
+	require.Len(t, entries, 3)
+	// Query params are kept so /api/resource?id=1 and ?id=2 stay
+	// distinguishable in the index...
+	assert.Contains(t, entries[1].URL, "id=1")
+	assert.Contains(t, entries[2].URL, "id=2")
+	// ...and the fragment-free URL under 100 chars is shown whole.
+	assert.Equal(t, "https://example.com/_next/static/chunks/4051.8ef8f2c36aab35cf.js?dpl=dpl_3Jw8vhcQQWEZCvVexEep", entries[0].URL)
 }
 
 func TestGetEntriesFilterIsCaseInsensitiveSubstring(t *testing.T) {
@@ -1080,7 +1103,8 @@ func TestGetEntriesFilterIsCaseInsensitiveSubstring(t *testing.T) {
 	assert.Equal(t, 3, total)
 	require.Len(t, entries, 3)
 
-	// A filter containing stripped query text matches nothing.
+	// A filter containing query text matches nothing when the URL carries no
+	// query string at all.
 	entries, total = NewParser().GetEntries(archive, "users?x", "", 0, 10)
 	assert.Equal(t, 0, total)
 	assert.Empty(t, entries)
@@ -1112,7 +1136,7 @@ func TestGetEntriesIncludesBodyHash(t *testing.T) {
 	assert.Equal(t, 1, total)
 	require.Len(t, entries, 1)
 	sum := sha256.Sum256([]byte(body))
-	assert.Equal(t, fmt.Sprintf("body:%x", sum[:8]), entries[0].BodyHash)
+	assert.Equal(t, fmt.Sprintf("body:%x", sum), entries[0].BodyHash)
 	assert.Equal(t, 200, entries[0].Status)
 	assert.Equal(t, "application/json", entries[0].MimeType)
 	assert.Equal(t, int64(len(body)), entries[0].Size)
@@ -1132,7 +1156,7 @@ func TestLoadPolicyExcludedMimeNotStored(t *testing.T) {
 	assert.Empty(t, details.Response.Content.Hash)
 
 	sum := sha256.Sum256([]byte(body))
-	ref := fmt.Sprintf("body:%x", sum[:8])
+	ref := fmt.Sprintf("body:%x", sum)
 	chunk, err := parser.GetResponseBody(ref, 0, 4096)
 	assert.EqualError(t, err, "unknown body hash: "+ref)
 	assert.Nil(t, chunk)
@@ -1188,4 +1212,239 @@ func TestParseReplacesBodyStore(t *testing.T) {
 	chunk, err := parser.GetResponseBody(secondDetails.Response.Content.Hash, 0, 4096)
 	require.NoError(t, err)
 	assert.Equal(t, "second body", chunk.Text)
+}
+
+// URL surface tests: query params are kept, redacted, and capped
+
+func TestGetEntriesCapsLongURL(t *testing.T) {
+	tail := "TAILMARKER"
+	longValue := strings.Repeat("a", 100) + tail + strings.Repeat("b", 40)
+	url := "https://example.com/api/search?q=" + longValue
+	harData := fmt.Sprintf(`{
+		"log": {
+			"version": "1.2",
+			"creator": {"name": "test-creator", "version": "1.0"},
+			"entries": [{
+				"startedDateTime": "2023-01-01T00:00:00.000Z",
+				"time": 100,
+				"request": {"method": "GET", "url": %q, "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "queryString": [], "headersSize": 150, "bodySize": 0},
+				"response": {"status": 200, "statusText": "OK", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "content": {"size": 2, "mimeType": "application/json"}, "redirectURL": "", "headersSize": 200, "bodySize": 2}
+			}]
+		}
+	}`, url)
+	archive := parseTestHAR(t, harData)
+
+	// The display is capped at maxIndexURLLen with an ellipsis...
+	entries, total := NewParser().GetEntries(archive, "", "", 0, 10)
+	assert.Equal(t, 1, total)
+	require.Len(t, entries, 1)
+	assert.True(t, strings.HasSuffix(entries[0].URL, "…"))
+	assert.LessOrEqual(t, len(entries[0].URL), maxIndexURLLen+len("…"))
+	assert.NotContains(t, entries[0].URL, tail)
+
+	// ...but the filter matches the FULL URL, including the part past the cap.
+	entries, total = NewParser().GetEntries(archive, tail, "", 0, 10)
+	assert.Equal(t, 1, total)
+	assert.Equal(t, "request_0", entries[0].RequestID)
+}
+
+func TestGetEntriesRedactsSensitiveQueryValues(t *testing.T) {
+	harData := fmt.Sprintf(`{
+		"log": {
+			"version": "1.2",
+			"creator": {"name": "test-creator", "version": "1.0"},
+			"entries": [{
+				"startedDateTime": "2023-01-01T00:00:00.000Z",
+				"time": 100,
+				"request": {"method": "GET", "url": %q, "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "queryString": [], "headersSize": 150, "bodySize": 0},
+				"response": {"status": 200, "statusText": "OK", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "content": {"size": 2, "mimeType": "application/json"}, "redirectURL": "", "headersSize": 200, "bodySize": 2}
+			}]
+		}
+	}`, "https://example.com/api/data?token=supersecret&id=42")
+	archive := parseTestHAR(t, harData)
+
+	entries, total := NewParser().GetEntries(archive, "", "", 0, 10)
+
+	assert.Equal(t, 1, total)
+	require.Len(t, entries, 1)
+	assert.Contains(t, entries[0].URL, "token=[REDACTED]")
+	assert.NotContains(t, entries[0].URL, "supersecret")
+	assert.Contains(t, entries[0].URL, "id=42")
+}
+
+func TestGetRequestDetailsRedactsQueryValues(t *testing.T) {
+	harData := fmt.Sprintf(`{
+		"log": {
+			"version": "1.2",
+			"creator": {"name": "test-creator", "version": "1.0"},
+			"entries": [{
+				"startedDateTime": "2023-01-01T00:00:00.000Z",
+				"time": 100,
+				"request": {"method": "GET", "url": %q, "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "queryString": [{"name": "token", "value": "supersecret"}, {"name": "id", "value": "42"}], "headersSize": 150, "bodySize": 0},
+				"response": {"status": 200, "statusText": "OK", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "content": {"size": 2, "mimeType": "application/json"}, "redirectURL": "", "headersSize": 200, "bodySize": 2}
+			}]
+		}
+	}`, "https://example.com/api/data?token=supersecret&id=42")
+	archive := parseTestHAR(t, harData)
+
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	assert.Contains(t, details.Request.URL, "token=[REDACTED]")
+	assert.NotContains(t, details.Request.URL, "supersecret")
+	for _, q := range details.Request.QueryString {
+		switch q.Name {
+		case "token":
+			assert.Equal(t, "[REDACTED]", q.Value)
+		case "id":
+			assert.Equal(t, "42", q.Value)
+		}
+	}
+}
+
+func TestGetRequestIDsForURLMethodMatchesRedactedURL(t *testing.T) {
+	harData := fmt.Sprintf(`{
+		"log": {
+			"version": "1.2",
+			"creator": {"name": "test-creator", "version": "1.0"},
+			"entries": [{
+				"startedDateTime": "2023-01-01T00:00:00.000Z",
+				"time": 100,
+				"request": {"method": "GET", "url": %q, "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "queryString": [], "headersSize": 150, "bodySize": 0},
+				"response": {"status": 200, "statusText": "OK", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "content": {"size": 2, "mimeType": "application/json"}, "redirectURL": "", "headersSize": 200, "bodySize": 2}
+			}]
+		}
+	}`, "https://example.com/api/data?token=abc123")
+	archive := parseTestHAR(t, harData)
+	parser := NewParser()
+
+	// The redacted form (what an agent copies from the index) matches...
+	ids := parser.GetRequestIDsForURLMethod(archive, "https://example.com/api/data?token=[REDACTED]", "GET")
+	assert.Equal(t, []string{"request_0"}, ids)
+	// ...and so does the raw form with any token value: matching runs on the
+	// normalized, redacted URL, so secrets never need to be re-typed.
+	ids = parser.GetRequestIDsForURLMethod(archive, "https://example.com/api/data?token=other", "GET")
+	assert.Equal(t, []string{"request_0"}, ids)
+}
+
+// Body store reference format tests
+
+func TestBodyHashIsFullSHA256(t *testing.T) {
+	body := `{"ok": true}`
+	archive := createResponseHAR(t, nil, "application/json", body)
+
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Response.Content)
+	assert.Regexp(t, `^body:[0-9a-f]{64}$`, details.Response.Content.Hash)
+}
+
+// Mime sniffing and preview truncation tests
+
+func TestMislabeledJSONGetsPreviewAndFetch(t *testing.T) {
+	parser := NewParser()
+	body := `{"ok": true}`
+	archive := createResponseHARWithParser(t, parser, nil, "application/octet-stream", body)
+
+	details, err := parser.GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Response.Content)
+	// The mime says binary, but the bytes are JSON: sniffed as readable.
+	assert.Equal(t, body, details.Response.Content.TextPreview)
+	assert.False(t, details.Response.Content.Truncated)
+	require.NotEmpty(t, details.Response.Content.Hash)
+
+	chunk, err := parser.GetResponseBody(details.Response.Content.Hash, 0, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, body, chunk.Text)
+	assert.Empty(t, chunk.Note)
+}
+
+func TestBinaryBytesGetNoPreview(t *testing.T) {
+	parser := NewParser()
+	archive := createResponseHARWithParser(t, parser, nil, "application/octet-stream", "\x00\x01\x02\x03")
+
+	details, err := parser.GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Response.Content)
+	assert.Empty(t, details.Response.Content.TextPreview)
+	assert.False(t, details.Response.Content.Truncated)
+
+	chunk, err := parser.GetResponseBody(details.Response.Content.Hash, 0, 4096)
+	require.NoError(t, err)
+	assert.Empty(t, chunk.Text)
+	assert.NotEmpty(t, chunk.Note)
+}
+
+func TestPreviewCutAtRuneBoundary(t *testing.T) {
+	body := strings.Repeat("a", maxBodyPreview-1) + "é" + strings.Repeat("b", 50)
+	archive := createResponseHAR(t, nil, "text/plain", body)
+
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Response.Content)
+	assert.True(t, details.Response.Content.Truncated)
+	assert.LessOrEqual(t, len(details.Response.Content.TextPreview), maxBodyPreview)
+	// The cut never splits a rune: the preview stays valid UTF-8.
+	assert.True(t, utf8.ValidString(details.Response.Content.TextPreview))
+}
+
+// BenchmarkParseWithBodies measures parse-time cost and allocation for a HAR
+// carrying many sizable bodies — the memory/GC profile the body store is
+// responsible for.
+func BenchmarkParseWithBodies(b *testing.B) {
+	body := strings.Repeat("payload-data-", 4096) // ~49KB
+	encoded := base64.StdEncoding.EncodeToString([]byte(body))
+	var sb strings.Builder
+	sb.WriteString(`{"log":{"version":"1.2","creator":{"name":"bench","version":"1"},"entries":[`)
+	for i := 0; i < 50; i++ {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, `{"startedDateTime":"2023-01-01T00:00:00Z","time":1,"request":{"method":"GET","url":"https://example.com/%d","httpVersion":"HTTP/1.1","cookies":[],"headers":[],"queryString":[],"headersSize":0,"bodySize":0},"response":{"status":200,"statusText":"OK","httpVersion":"HTTP/1.1","cookies":[],"headers":[],"content":{"size":%d,"mimeType":"text/plain","text":%q},"redirectURL":"","headersSize":0,"bodySize":%d}}`, i, len(body), encoded, len(body))
+	}
+	sb.WriteString(`]}}`)
+	data := sb.String()
+
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := NewParser().Parse(strings.NewReader(data)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// FuzzBodyReadable checks the text/binary classifier on arbitrary mime types
+// and bytes: it must never panic, and the verdict must not depend on whether
+// the whole body or only its leading sample is inspected (the sniff only
+// ever looks at the first textSniffSample bytes).
+func FuzzBodyReadable(f *testing.F) {
+	for _, seed := range []struct {
+		mime    string
+		content []byte
+	}{
+		{"application/json", []byte(`{"ok": true}`)},
+		{"text/html", []byte("<html>ok</html>")},
+		{"application/octet-stream", []byte(`{"mislabeled": 1}`)},
+		{"application/octet-stream", []byte("\x00\x01\x02binary")},
+		{"video/mp4", []byte("fakemp4bytes")},
+		{"", []byte("no mime at all")},
+	} {
+		f.Add(seed.mime, seed.content)
+	}
+
+	f.Fuzz(func(t *testing.T, mime string, content []byte) {
+		sample := content
+		if len(sample) > textSniffSample {
+			sample = sample[:textSniffSample]
+		}
+		if bodyReadable(mime, content) != bodyReadable(mime, sample) {
+			t.Fatalf("bodyReadable(%q, %d bytes) disagrees with its %d-byte sample", mime, len(content), len(sample))
+		}
+	})
 }

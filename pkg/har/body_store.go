@@ -5,9 +5,12 @@ import (
 	"fmt"
 )
 
-// BodyStore holds decoded response bodies keyed by a truncated SHA-256 of
-// their bytes, so identical bodies are stored once and referenced by hash.
-// References look like "body:<first 16 hex chars of the sha256>".
+// BodyStore holds decoded response bodies keyed by the full SHA-256 of their
+// bytes, so identical bodies are stored once and referenced by hash.
+// References look like "body:<64 hex sha256>". The digest is deliberately not
+// truncated: bodies come from untrusted HAR input, and a 64-bit prefix would
+// be collision-forgeable at ~2^32 work, letting one body's bytes serve under
+// another's reference.
 type BodyStore struct {
 	// ponytail: plain maps — the server is a single-threaded stdio process;
 	// add a mutex if an HTTP mode or any concurrency ever lands.
@@ -33,7 +36,7 @@ func (s *BodyStore) Add(body []byte, mimeType string) string {
 		return ""
 	}
 	hash := sha256.Sum256(body)
-	ref := fmt.Sprintf("body:%x", hash[:8])
+	ref := fmt.Sprintf("body:%x", hash)
 	if _, ok := s.bodies[ref]; !ok {
 		s.bodies[ref] = body
 		s.sizes[ref] = int64(len(body))

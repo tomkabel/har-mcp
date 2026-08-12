@@ -78,13 +78,13 @@ func (h *HARServer) createTools() []server.ServerTool {
 		{
 			Tool: mcp.Tool{
 				Name:        "list_entries",
-				Description: "List all HAR entries as one compact row each — method, status, mime type, size, timing, and body hash. Query params are stripped from URLs; use get_request_details for the full URL. This is the primary index: call this first, then get_request_details, then get_response_body.",
+				Description: "List all HAR entries as one compact row each — method, status, mime type, size, timing, and body hash. URLs keep query params (capped at 100 chars; sensitive values redacted). This is the primary index: call this first, then get_request_details, then get_response_body.",
 				InputSchema: mcp.ToolInputSchema{
 					Type: "object",
 					Properties: map[string]interface{}{
 						"filter": map[string]interface{}{
 							"type":        "string",
-							"description": "Substring match on the request URL path (query params are stripped from displayed URLs)",
+							"description": "Substring match on the request URL including query params (sensitive values matched in redacted form)",
 						},
 						"method": map[string]interface{}{
 							"type":        "string",
@@ -112,7 +112,7 @@ func (h *HARServer) createTools() []server.ServerTool {
 					Properties: map[string]interface{}{
 						"url": map[string]interface{}{
 							"type":        "string",
-							"description": "The URL to filter by",
+							"description": "The URL to filter by (matched in normalized form: fragment stripped, sensitive query values redacted)",
 						},
 						"method": map[string]interface{}{
 							"type":        "string",
@@ -127,7 +127,7 @@ func (h *HARServer) createTools() []server.ServerTool {
 		{
 			Tool: mcp.Tool{
 				Name:        "get_request_details",
-				Description: "Get full request details by request ID (authentication headers will be redacted)",
+				Description: "Get full request details by request ID (authentication headers and sensitive query values redacted). Text bodies up to 4KB are fully inlined in response.content.textPreview; larger bodies return the first 4KB plus a content.hash for get_response_body.",
 				InputSchema: mcp.ToolInputSchema{
 					Type: "object",
 					Properties: map[string]interface{}{

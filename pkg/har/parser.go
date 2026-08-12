@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/martian/har"
 )
@@ -212,7 +213,10 @@ func (p *Parser) GetRequestIDsForURLMethod(harData *har.HAR, targetURL, method s
 			continue
 		}
 
-		if entry.Request.URL == targetURL && entry.Request.Method == method {
+		// Match on normalized URLs (fragment stripped, sensitive query
+		// values redacted) so the form an agent copies from list_entries or
+		// get_request_details round-trips into this query.
+		if normalizeURL(entry.Request.URL) == normalizeURL(targetURL) && entry.Request.Method == method {
 			requestID := fmt.Sprintf("request_%d", i)
 			requestIDs = append(requestIDs, requestID)
 		}
@@ -224,11 +228,13 @@ func (p *Parser) GetRequestIDsForURLMethod(harData *har.HAR, targetURL, method s
 // EntrySummary is one compact row per HAR entry: the whole-file index view
 // the agent sees in a single list_entries call. Deliberately flat and
 // minimal — no headers, no startedDateTime (get_request_details has the full
-// picture). URL has query params and fragment stripped.
+// picture). URL is the normalized request URL (fragment stripped, sensitive
+// query values redacted) capped at maxIndexURLLen; the full URL is in
+// get_request_details.
 type EntrySummary struct {
 	RequestID string  `json:"requestId"` // positional "request_%d"
 	Method    string  `json:"method"`
-	URL       string  `json:"url"`    // query params STRIPPED
+	URL       string  `json:"url"`    // normalized, capped at maxIndexURLLen
 	Status    int     `json:"status"` // 0 when no response
 	MimeType  string  `json:"mimeType,omitempty"`
 	Size      int64   `json:"size,omitempty"` // decoded response body size
@@ -238,11 +244,13 @@ type EntrySummary struct {
 
 // GetEntries returns a page of compact per-entry rows in file order plus the
 // total number of matching entries before pagination. filter is a
-// case-insensitive substring match on the query-stripped URL; method is an
-// exact match; either filter is ignored when empty. Entries with a nil
-// Request are skipped and do not count toward total. offset clamps to 0;
-// limit defaults to 200 and caps at 1000. The returned page starts at
-// offset and may be shorter than limit at the end of the match set.
+// case-insensitive substring match on the normalized URL — query params
+// included, sensitive values redacted — so it never matches against the
+// capped display form; method is an exact match; either filter is ignored
+// when empty. Entries with a nil Request are skipped and do not count toward
+// total. offset clamps to 0; limit defaults to 200 and caps at 1000. The
+// returned page starts at offset and may be shorter than limit at the end of
+// the match set.
 func (p *Parser) GetEntries(harData *har.HAR, filter, method string, offset, limit int) ([]EntrySummary, int) {
 	if offset < 0 {
 		offset = 0
@@ -259,7 +267,7 @@ func (p *Parser) GetEntries(harData *har.HAR, filter, method string, offset, lim
 		if entry.Request == nil {
 			continue
 		}
-		url := stripQuery(entry.Request.URL)
+		url := normalizeURL(entry.Request.URL)
 		if filter != "" && !strings.Contains(strings.ToLower(url), strings.ToLower(filter)) {
 			continue
 		}
@@ -269,7 +277,7 @@ func (p *Parser) GetEntries(harData *har.HAR, filter, method string, offset, lim
 		row := EntrySummary{
 			RequestID: fmt.Sprintf("request_%d", i),
 			Method:    entry.Request.Method,
-			URL:       url,
+			URL:       capURL(url),
 			TimeMs:    float64(entry.Time),
 		}
 		if entry.Response != nil {
@@ -298,16 +306,87 @@ func (p *Parser) GetEntries(harData *har.HAR, filter, method string, offset, lim
 	return matches[offset:end], len(matches)
 }
 
-// stripQuery removes the query string and fragment from a URL for compact
-// index rows. On parse error the raw URL is returned unchanged.
-func stripQuery(raw string) string {
+// sensitiveQueryKeys are query parameter names whose values are redacted
+// from URLs and query strings. Header-name redaction cannot reach query
+// strings, which commonly carry tokens (OAuth state, signed URLs, API keys).
+// Bare "key" is deliberately absent: too generic, redacting every ?key=value
+// would blind the index for ordinary lookups.
+var sensitiveQueryKeys = map[string]bool{
+	"access_token":  true,
+	"api_key":       true,
+	"apikey":        true,
+	"auth":          true,
+	"authorization": true,
+	"jwt":           true,
+	"password":      true,
+	"passwd":        true,
+	"pwd":           true,
+	"secret":        true,
+	"session":       true,
+	"sessionid":     true,
+	"sid":           true,
+	"sig":           true,
+	"signature":     true,
+	"token":         true,
+}
+
+// normalizeURL returns a URL in canonical display and matching form: the
+// fragment stripped and sensitive query values redacted. On parse error the
+// raw input is returned unchanged. Matching (GetEntries filters,
+// GetRequestIDsForURLMethod) compares normalized forms so what an agent
+// copies from an index row or details call round-trips into queries.
+func normalizeURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return raw
 	}
-	u.RawQuery = ""
 	u.Fragment = ""
+	if u.RawQuery != "" {
+		u.RawQuery = redactRawQuery(u.RawQuery)
+	}
 	return u.String()
+}
+
+// redactRawQuery replaces the values of sensitive query parameters in a raw
+// query string, preserving the order and escaping of non-sensitive pairs.
+func redactRawQuery(rawQuery string) string {
+	var kept []string
+	for _, pair := range strings.Split(rawQuery, "&") {
+		key, _, _ := strings.Cut(pair, "=")
+		if decoded, err := url.QueryUnescape(key); err == nil && sensitiveQueryKeys[strings.ToLower(decoded)] {
+			kept = append(kept, key+"=[REDACTED]")
+		} else {
+			kept = append(kept, pair)
+		}
+	}
+	return strings.Join(kept, "&")
+}
+
+// redactQueryString redacts the values of sensitive query parameters in a
+// har.QueryString slice, leaving everything else untouched.
+func redactQueryString(qs []har.QueryString) []har.QueryString {
+	out := make([]har.QueryString, len(qs))
+	for i, q := range qs {
+		out[i] = q
+		if sensitiveQueryKeys[strings.ToLower(q.Name)] {
+			out[i].Value = "[REDACTED]"
+		}
+	}
+	return out
+}
+
+// maxIndexURLLen caps the URL shown in a list_entries row. Query params are
+// kept — they often discriminate requests (resource ids, pagination tokens) —
+// but a row must stay compact, so longer URLs are cut at a rune boundary.
+const maxIndexURLLen = 100
+
+// capURL cuts s to at most maxIndexURLLen bytes (rune-safe) and appends an
+// ellipsis when it was cut. Matching never runs against the capped form.
+func capURL(s string) string {
+	if len(s) <= maxIndexURLLen {
+		return s
+	}
+	return cutRunes(s, maxIndexURLLen) + "…"
 }
 
 // RequestDetails represents the full details of a request with auth headers
@@ -402,14 +481,14 @@ func (p *Parser) GetRequestDetails(harData *har.HAR, requestID string) (*Request
 
 	entry := harData.Log.Entries[index]
 
-	// Create request info with redacted headers
+	// Create request info with redacted headers and query values
 	requestInfo := &RequestInfo{
 		Method:      entry.Request.Method,
-		URL:         entry.Request.URL,
+		URL:         normalizeURL(entry.Request.URL),
 		HTTPVersion: entry.Request.HTTPVersion,
 		Cookies:     entry.Request.Cookies,
 		Headers:     p.redactAuthHeaders(entry.Request.Headers),
-		QueryString: entry.Request.QueryString,
+		QueryString: redactQueryString(entry.Request.QueryString),
 		PostData:    p.buildPostDataInfo(entry.Request.PostData),
 		HeadersSize: entry.Request.HeadersSize,
 		BodySize:    entry.Request.BodySize,
@@ -458,13 +537,13 @@ func (p *Parser) buildResponseInfo(resp *har.Response) *ResponseInfo {
 		if p.shouldStore(resp.Content.MimeType, int64(len(resp.Content.Text))) {
 			info.Content.Hash = p.bodies.Add(resp.Content.Text, resp.Content.MimeType)
 		}
-		if isTextMime(resp.Content.MimeType) && len(resp.Content.Text) > 0 {
-			preview := resp.Content.Text
+		if bodyReadable(resp.Content.MimeType, resp.Content.Text) && len(resp.Content.Text) > 0 {
+			preview := string(resp.Content.Text)
 			if len(preview) > maxBodyPreview {
-				preview = preview[:maxBodyPreview]
+				preview = cutRunes(preview, maxBodyPreview)
 				info.Content.Truncated = true
 			}
-			info.Content.TextPreview = string(preview)
+			info.Content.TextPreview = preview
 		}
 	}
 
@@ -490,10 +569,10 @@ func (p *Parser) buildPostDataInfo(pd *har.PostData) *PostDataInfo {
 	if p.shouldStore(pd.MimeType, int64(len(pd.Text))) {
 		info.Hash = p.bodies.Add([]byte(pd.Text), pd.MimeType)
 	}
-	if isTextMime(pd.MimeType) && len(pd.Text) > 0 {
+	if bodyReadable(pd.MimeType, []byte(pd.Text)) && len(pd.Text) > 0 {
 		preview := pd.Text
 		if len(preview) > maxBodyPreview {
-			preview = preview[:maxBodyPreview]
+			preview = cutRunes(preview, maxBodyPreview)
 			info.Truncated = true
 		}
 		info.TextPreview = preview
@@ -514,6 +593,58 @@ func isTextMime(mime string) bool {
 		mime == "application/x-www-form-urlencoded" ||
 		strings.HasSuffix(mime, "+json") ||
 		strings.HasSuffix(mime, "+xml")
+}
+
+// textSniffSample is how many leading bytes are inspected when the declared
+// mime type does not identify a body as text.
+const textSniffSample = 512
+
+// looksLikeText is a cheap content sniff for bodies whose declared mime type
+// is missing or wrong (e.g. JSON served as application/octet-stream). A body
+// counts as text when a leading sample is valid UTF-8 with no C0 control
+// bytes: text, JSON, HTML, JS all pass; decoded binary fails on its first
+// NUL. It is a heuristic, not a verdict: base64-ascii payloads pass, which is
+// fine — the preview is bounded either way.
+func looksLikeText(content []byte) bool {
+	if len(content) == 0 {
+		return false
+	}
+	sample := content
+	if len(sample) > textSniffSample {
+		sample = sample[:textSniffSample]
+	}
+	if !utf8.Valid(sample) {
+		return false
+	}
+	for _, b := range sample {
+		if b < 0x20 && b != '	' && b != '\n' && b != '\r' && b != '\f' {
+			return false
+		}
+		if b == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// bodyReadable reports whether a body deserves a text preview: either the
+// declared mime says text, or the bytes themselves look like text. Bodies
+// that fail both are treated as binary and get metadata only.
+func bodyReadable(mime string, content []byte) bool {
+	return isTextMime(mime) || looksLikeText(content)
+}
+
+// cutRunes truncates s to at most max bytes without splitting a UTF-8 rune.
+// Slicing mid-rune yields invalid UTF-8 that json.Marshal would silently
+// replace with U+FFFD, corrupting the tail of every truncated preview.
+func cutRunes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
 
 // redactAuthHeaders redacts sensitive authentication headers
@@ -608,7 +739,7 @@ func (p *Parser) GetResponseBody(ref string, offset, limit int) (*BodyChunk, err
 		MimeType:  mime,
 	}
 
-	if !isTextMime(mime) {
+	if !bodyReadable(mime, body) {
 		chunk.Note = "binary body, not readable — metadata only"
 		return chunk, nil
 	}
