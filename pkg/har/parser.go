@@ -15,12 +15,16 @@ import (
 	"github.com/google/martian/har"
 )
 
-// Parser handles HAR file parsing from various sources
-type Parser struct{}
+// Parser handles HAR file parsing from various sources. It holds the body
+// store populated at parse time, so decoded response bodies can be fetched
+// later by content hash.
+type Parser struct {
+	bodies *BodyStore
+}
 
 // NewParser creates a new HAR parser
 func NewParser() *Parser {
-	return &Parser{}
+	return &Parser{bodies: NewBodyStore()}
 }
 
 // ParseFromFile parses a HAR file from disk
@@ -62,6 +66,7 @@ func (p *Parser) Parse(r io.Reader) (*har.HAR, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(&harData); err == nil {
 		// Standard parsing succeeded
+		p.indexResponseBodies(&harData)
 		return &harData, nil
 	}
 
@@ -73,7 +78,22 @@ func (p *Parser) Parse(r io.Reader) (*har.HAR, error) {
 	}
 
 	// Convert flexible HAR to standard HAR
-	return flexibleHAR.ToStandardHAR(), nil
+	standardHAR := flexibleHAR.ToStandardHAR()
+	p.indexResponseBodies(standardHAR)
+	return standardHAR, nil
+}
+
+// indexResponseBodies stores every non-empty decoded response body in the
+// body store, deduplicated by content hash. This is the single choke point
+// where bodies enter the store, covering both the standard decode and the
+// FlexibleHAR fallback.
+func (p *Parser) indexResponseBodies(harData *har.HAR) {
+	for _, entry := range harData.Log.Entries {
+		if entry.Response == nil || entry.Response.Content == nil {
+			continue
+		}
+		p.bodies.Add(entry.Response.Content.Text, entry.Response.Content.MimeType)
+	}
 }
 
 // URLMethodEntry represents a URL and method combination with associated request IDs
@@ -167,11 +187,13 @@ type ResponseInfo struct {
 
 // ContentInfo is response content metadata with a bounded text preview. Binary
 // content (video, images, fonts) carries metadata only — an LLM cannot read
-// it, so shipping even a preview is token waste.
+// it, so shipping even a preview is token waste. Hash is the body-store
+// reference for the full decoded body, fetched on demand via get_response_body.
 type ContentInfo struct {
 	Size        int64  `json:"size"`
 	MimeType    string `json:"mimeType"`
 	Encoding    string `json:"encoding,omitempty"`
+	Hash        string `json:"hash,omitempty"`
 	TextPreview string `json:"textPreview,omitempty"`
 	Truncated   bool   `json:"truncated,omitempty"`
 }
@@ -257,6 +279,9 @@ func (p *Parser) buildResponseInfo(resp *har.Response) *ResponseInfo {
 			Size:     resp.Content.Size,
 			MimeType: resp.Content.MimeType,
 			Encoding: resp.Content.Encoding,
+			// Add is idempotent: bodies already indexed at parse time are
+			// returned by reference without re-storing.
+			Hash: p.bodies.Add(resp.Content.Text, resp.Content.MimeType),
 		}
 		if isTextMime(resp.Content.MimeType) && len(resp.Content.Text) > 0 {
 			preview := resp.Content.Text
@@ -319,4 +344,71 @@ func (p *Parser) ParseSource(source string) (*har.HAR, error) {
 
 	// Otherwise treat as file path
 	return p.ParseFromFile(source)
+}
+
+// BodyChunk is a bounded slice of a stored response body. Text bodies carry
+// the chunk in Text; binary bodies carry metadata and a Note instead, because
+// the bytes are not LLM-readable.
+type BodyChunk struct {
+	Hash      string `json:"hash"`
+	Offset    int    `json:"offset"`
+	Limit     int    `json:"limit"`
+	TotalSize int64  `json:"totalSize"`
+	Truncated bool   `json:"truncated"`
+	Text      string `json:"text,omitempty"`
+	MimeType  string `json:"mimeType"`
+	Note      string `json:"note,omitempty"`
+}
+
+// defaultBodyChunk is the chunk size used when the caller omits limit.
+const defaultBodyChunk = 4096
+
+// maxBodyChunk caps a single chunk so a fetch cannot dump an unbounded body
+// into the agent context.
+const maxBodyChunk = 64 * 1024
+
+// GetResponseBody returns a chunk of a stored response body between offset
+// and offset+limit. Offset is clamped to 0; a missing or negative limit
+// defaults to defaultBodyChunk and is capped at maxBodyChunk. Binary bodies
+// return metadata only — the bytes are never shipped.
+func (p *Parser) GetResponseBody(ref string, offset, limit int) (*BodyChunk, error) {
+	body, totalSize, mime, ok := p.bodies.Get(ref)
+	if !ok {
+		return nil, fmt.Errorf("unknown body hash: %s", ref)
+	}
+
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = defaultBodyChunk
+	}
+	if limit > maxBodyChunk {
+		limit = maxBodyChunk
+	}
+
+	chunk := &BodyChunk{
+		Hash:      ref,
+		Offset:    offset,
+		Limit:     limit,
+		TotalSize: totalSize,
+		MimeType:  mime,
+	}
+
+	if !isTextMime(mime) {
+		chunk.Note = "binary body, not readable — metadata only"
+		return chunk, nil
+	}
+
+	start := offset
+	if start > len(body) {
+		start = len(body)
+	}
+	end := start + limit
+	if end > len(body) {
+		end = len(body)
+	}
+	chunk.Text = string(body[start:end])
+	chunk.Truncated = end < len(body)
+	return chunk, nil
 }

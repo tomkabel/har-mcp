@@ -145,6 +145,25 @@ Get full request details by request ID. Authentication headers will be automatic
 - Set-Cookie
 - Proxy-Authorization
 
+#### 5. `get_response_body`
+Fetch a chunk of a stored response body by content hash. The hash is returned as
+`response.content.hash` by `get_request_details`. Text bodies return the decoded bytes
+between `offset` and `offset + limit`; binary bodies return metadata only.
+
+**Parameters:**
+- `hash` (string, required): Content hash reference of the body to fetch
+- `offset` (number, optional, default 0): Byte offset into the decoded body
+- `limit` (number, optional, default 4096): Maximum number of bytes to return (max 65536)
+
+**Example:**
+```json
+{
+  "hash": "body:3f2a1c9d8e7b6a5f",
+  "offset": 0,
+  "limit": 4096
+}
+```
+
 ## Integration with Claude Desktop
 
 Add the following to your Claude Desktop configuration:
@@ -176,7 +195,9 @@ go test ./...
 │       └── main.go
 ├── pkg/
 │   └── har/           # HAR parsing library
+│       ├── body_store.go
 │       ├── parser.go
+│       ├── custom_types.go
 │       └── parser_test.go
 ├── go.mod
 ├── go.sum

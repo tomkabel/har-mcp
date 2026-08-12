@@ -112,6 +112,31 @@ func (h *HARServer) createTools() []server.ServerTool {
 			},
 			Handler: h.handleGetRequestDetails,
 		},
+		{
+			Tool: mcp.Tool{
+				Name:        "get_response_body",
+				Description: "Fetch a chunk of a stored response body by content hash (returned as response.content.hash by get_request_details). Text bodies return the decoded bytes between offset and offset+limit; binary bodies return metadata only.",
+				InputSchema: mcp.ToolInputSchema{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"hash": map[string]interface{}{
+							"type":        "string",
+							"description": "Content hash reference of the body to fetch",
+						},
+						"offset": map[string]interface{}{
+							"type":        "number",
+							"description": "Byte offset into the decoded body (default 0)",
+						},
+						"limit": map[string]interface{}{
+							"type":        "number",
+							"description": "Maximum number of bytes to return (default 4096, max 65536)",
+						},
+					},
+					Required: []string{"hash"},
+				},
+			},
+			Handler: h.handleGetResponseBody,
+		},
 	}
 }
 
@@ -206,6 +231,34 @@ func (h *HARServer) handleGetRequestDetails(ctx context.Context, request mcp.Cal
 	data, err := json.MarshalIndent(details, "", "  ")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to marshal request details: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(string(data)), nil
+}
+
+// handleGetResponseBody handles the get_response_body tool call
+func (h *HARServer) handleGetResponseBody(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if h.harData == nil {
+		return mcp.NewToolResultError("No HAR file loaded. Please load a HAR file first using load_har."), nil
+	}
+
+	var args struct {
+		Hash   string `json:"hash"`
+		Offset int    `json:"offset"`
+		Limit  int    `json:"limit"`
+	}
+	if err := request.BindArguments(&args); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Invalid arguments: %v", err)), nil
+	}
+
+	chunk, err := h.parser.GetResponseBody(args.Hash, args.Offset, args.Limit)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Error getting response body: %v", err)), nil
+	}
+
+	data, err := json.MarshalIndent(chunk, "", "  ")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to marshal response body: %v", err)), nil
 	}
 
 	return mcp.NewToolResultText(string(data)), nil

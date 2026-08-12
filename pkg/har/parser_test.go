@@ -1,6 +1,7 @@
 package har
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -321,9 +322,17 @@ func TestGetRequestDetails(t *testing.T) {
 }
 
 // createResponseHAR creates a HAR with a single entry whose response has the
-// given headers, mime type and body text. The body is emitted base64-encoded
-// because Go's encoding/json base64-decodes JSON strings into []byte fields.
+// given headers, mime type and body text, parsed with a fresh parser. The
+// body is emitted base64-encoded because Go's encoding/json base64-decodes
+// JSON strings into []byte fields.
 func createResponseHAR(t *testing.T, headers []har.Header, mimeType, body string) *har.HAR {
+	t.Helper()
+	return createResponseHARWithParser(t, NewParser(), headers, mimeType, body)
+}
+
+// createResponseHARWithParser is createResponseHAR but parsed with the given
+// parser, so the body lands in that parser's body store at parse time.
+func createResponseHARWithParser(t *testing.T, parser *Parser, headers []har.Header, mimeType, body string) *har.HAR {
 	t.Helper()
 
 	headerJSON, err := json.Marshal(headers)
@@ -367,7 +376,11 @@ func createResponseHAR(t *testing.T, headers []har.Header, mimeType, body string
 		}
 	}`, string(headerJSON), len(body), mimeType, base64.StdEncoding.EncodeToString([]byte(body)), len(body))
 
-	return parseTestHAR(t, harData)
+	archive, err := parser.Parse(strings.NewReader(harData))
+	require.NoError(t, err, "failed to parse test HAR data")
+	require.NotNil(t, archive, "parsed archive should not be nil")
+
+	return archive
 }
 
 func TestGetRequestDetailsRedactsResponseHeaders(t *testing.T) {
@@ -760,4 +773,135 @@ func TestParseComplexHAR(t *testing.T) {
 	}
 	require.NotNil(t, authHeader)
 	assert.Equal(t, "[REDACTED]", authHeader.Value)
+}
+
+// Body store tests
+
+func TestBodyStoreDedupsIdenticalBodies(t *testing.T) {
+	parser := NewParser()
+	encoded := base64.StdEncoding.EncodeToString([]byte("same-response-body"))
+	harData := fmt.Sprintf(`{
+		"log": {
+			"version": "1.2",
+			"creator": {"name": "test-creator", "version": "1.0"},
+			"entries": [
+				{
+					"startedDateTime": "2023-01-01T00:00:00.000Z",
+					"time": 100,
+					"request": {"method": "GET", "url": "https://example.com/a", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "queryString": [], "headersSize": 150, "bodySize": 0},
+					"response": {"status": 200, "statusText": "OK", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "content": {"size": 18, "mimeType": "application/json", "text": %q}, "redirectURL": "", "headersSize": 200, "bodySize": 18}
+				},
+				{
+					"startedDateTime": "2023-01-01T00:00:01.000Z",
+					"time": 100,
+					"request": {"method": "GET", "url": "https://example.com/b", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "queryString": [], "headersSize": 150, "bodySize": 0},
+					"response": {"status": 200, "statusText": "OK", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "content": {"size": 18, "mimeType": "application/json", "text": %q}, "redirectURL": "", "headersSize": 200, "bodySize": 18}
+				}
+			]
+		}
+	}`, encoded, encoded)
+
+	archive, err := parser.Parse(strings.NewReader(harData))
+	require.NoError(t, err)
+	require.Len(t, archive.Log.Entries, 2)
+
+	first, err := parser.GetRequestDetails(archive, "request_0")
+	require.NoError(t, err)
+	second, err := parser.GetRequestDetails(archive, "request_1")
+	require.NoError(t, err)
+
+	require.NotEmpty(t, first.Response.Content.Hash)
+	// Identical bodies share one hash reference...
+	assert.Equal(t, first.Response.Content.Hash, second.Response.Content.Hash)
+	// ...and are stored once, not once per entry.
+	assert.Len(t, parser.bodies.bodies, 1)
+}
+
+func TestGetRequestDetailsIncludesBodyHash(t *testing.T) {
+	body := `{"ok": true}`
+	archive := createResponseHAR(t, nil, "application/json", body)
+
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Response.Content)
+	sum := sha256.Sum256([]byte(body))
+	assert.Equal(t, fmt.Sprintf("body:%x", sum[:8]), details.Response.Content.Hash)
+}
+
+func TestGetResponseBodyChunking(t *testing.T) {
+	parser := NewParser()
+	body := strings.Repeat("0123456789", 800) // 8000 bytes
+	archive := createResponseHARWithParser(t, parser, nil, "text/plain", body)
+	require.NotNil(t, archive)
+
+	details, err := parser.GetRequestDetails(archive, "request_0")
+	require.NoError(t, err)
+	require.NotEmpty(t, details.Response.Content.Hash)
+	ref := details.Response.Content.Hash
+
+	// First chunk: bytes 0..4095, more remains.
+	chunk, err := parser.GetResponseBody(ref, 0, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, ref, chunk.Hash)
+	assert.Equal(t, int64(len(body)), chunk.TotalSize)
+	assert.Equal(t, "text/plain", chunk.MimeType)
+	assert.Equal(t, body[:4096], chunk.Text)
+	assert.True(t, chunk.Truncated)
+
+	// Second chunk: the 3904-byte tail, nothing remains.
+	chunk, err = parser.GetResponseBody(ref, 4096, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, body[4096:], chunk.Text)
+	assert.False(t, chunk.Truncated)
+}
+
+func TestGetResponseBodyClampsBounds(t *testing.T) {
+	parser := NewParser()
+	body := strings.Repeat("0123456789", 800) // 8000 bytes
+	archive := createResponseHARWithParser(t, parser, nil, "text/plain", body)
+	require.NotNil(t, archive)
+
+	details, err := parser.GetRequestDetails(archive, "request_0")
+	require.NoError(t, err)
+	require.NotEmpty(t, details.Response.Content.Hash)
+	ref := details.Response.Content.Hash
+
+	// Negative offset clamps to 0; oversized limit caps at maxBodyChunk.
+	chunk, err := parser.GetResponseBody(ref, -100, 1<<20)
+	require.NoError(t, err)
+	assert.Equal(t, 0, chunk.Offset)
+	assert.Equal(t, maxBodyChunk, chunk.Limit)
+	assert.Equal(t, body, chunk.Text)
+
+	// Offset past the end yields an empty, untruncated chunk.
+	chunk, err = parser.GetResponseBody(ref, len(body)+100, 4096)
+	require.NoError(t, err)
+	assert.Empty(t, chunk.Text)
+	assert.False(t, chunk.Truncated)
+}
+
+func TestGetResponseBodyBinaryMetadataOnly(t *testing.T) {
+	parser := NewParser()
+	archive := createResponseHARWithParser(t, parser, nil, "video/mp4", "binary-garbage")
+	require.NotNil(t, archive)
+
+	details, err := parser.GetRequestDetails(archive, "request_0")
+	require.NoError(t, err)
+	require.NotEmpty(t, details.Response.Content.Hash)
+
+	chunk, err := parser.GetResponseBody(details.Response.Content.Hash, 0, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, int64(len("binary-garbage")), chunk.TotalSize)
+	assert.Equal(t, "video/mp4", chunk.MimeType)
+	assert.Empty(t, chunk.Text)
+	assert.NotEmpty(t, chunk.Note)
+	assert.False(t, chunk.Truncated)
+}
+
+func TestGetResponseBodyUnknownHash(t *testing.T) {
+	chunk, err := NewParser().GetResponseBody("body:0000000000000000", 0, 4096)
+	assert.Error(t, err)
+	assert.Nil(t, chunk)
+	assert.Contains(t, err.Error(), "unknown body hash")
 }
