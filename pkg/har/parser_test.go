@@ -1,6 +1,9 @@
 package har
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -315,6 +318,101 @@ func TestGetRequestDetails(t *testing.T) {
 	}
 	require.NotNil(t, userAgentHeader)
 	assert.Equal(t, "Test", userAgentHeader.Value)
+}
+
+// createResponseHAR creates a HAR with a single entry whose response has the
+// given headers, mime type and body text. The body is emitted base64-encoded
+// because Go's encoding/json base64-decodes JSON strings into []byte fields.
+func createResponseHAR(t *testing.T, headers []har.Header, mimeType, body string) *har.HAR {
+	t.Helper()
+
+	headerJSON, err := json.Marshal(headers)
+	require.NoError(t, err, "failed to marshal test headers")
+
+	harData := fmt.Sprintf(`{
+		"log": {
+			"version": "1.2",
+			"creator": {"name": "test-creator", "version": "1.0"},
+			"entries": [
+				{
+					"startedDateTime": "2023-01-01T00:00:00.000Z",
+					"time": 100,
+					"request": {
+						"method": "GET",
+						"url": "https://example.com",
+						"httpVersion": "HTTP/1.1",
+						"cookies": [],
+						"headers": [],
+						"queryString": [],
+						"headersSize": 150,
+						"bodySize": 0
+					},
+					"response": {
+						"status": 200,
+						"statusText": "OK",
+						"httpVersion": "HTTP/1.1",
+						"cookies": [],
+						"headers": %s,
+						"content": {
+							"size": %d,
+							"mimeType": %q,
+							"text": %q
+						},
+						"redirectURL": "",
+						"headersSize": 200,
+						"bodySize": %d
+					}
+				}
+			]
+		}
+	}`, string(headerJSON), len(body), mimeType, base64.StdEncoding.EncodeToString([]byte(body)), len(body))
+
+	return parseTestHAR(t, harData)
+}
+
+func TestGetRequestDetailsRedactsResponseHeaders(t *testing.T) {
+	archive := createResponseHAR(t, []har.Header{
+		{Name: "Content-Type", Value: "text/html"},
+		{Name: "Set-Cookie", Value: "session=secret"},
+	}, "text/html", "<html>ok</html>")
+
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Response)
+	for _, header := range details.Response.Headers {
+		switch header.Name {
+		case "Content-Type":
+			assert.Equal(t, "text/html", header.Value)
+		case "Set-Cookie":
+			assert.Equal(t, "[REDACTED]", header.Value)
+		}
+	}
+}
+
+func TestGetRequestDetailsTruncatesLargeBodyPreview(t *testing.T) {
+	body := strings.Repeat("a", maxBodyPreview+100)
+	archive := createResponseHAR(t, nil, "text/plain", body)
+
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Response.Content)
+	assert.True(t, details.Response.Content.Truncated)
+	assert.Equal(t, maxBodyPreview, len(details.Response.Content.TextPreview))
+	assert.Equal(t, int64(len(body)), details.Response.Content.Size)
+}
+
+func TestGetRequestDetailsBinaryBodyMetadataOnly(t *testing.T) {
+	archive := createResponseHAR(t, nil, "video/mp4", "binary-garbage")
+
+	details, err := NewParser().GetRequestDetails(archive, "request_0")
+
+	require.NoError(t, err)
+	require.NotNil(t, details.Response.Content)
+	assert.Empty(t, details.Response.Content.TextPreview)
+	assert.False(t, details.Response.Content.Truncated)
+	assert.Equal(t, "video/mp4", details.Response.Content.MimeType)
 }
 
 func TestGetRequestDetailsInvalidID(t *testing.T) {

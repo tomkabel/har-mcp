@@ -134,19 +134,52 @@ func (p *Parser) GetRequestIDsForURLMethod(harData *har.HAR, targetURL, method s
 	return requestIDs
 }
 
-// RequestDetails represents the full details of a request with auth headers redacted
+// RequestDetails represents the full details of a request with auth headers
+// redacted and response bodies bounded to a preview. Raw bodies are never
+// included: a huge response (e.g. a base64 mp4) would otherwise dump hundreds
+// of thousands of tokens into the agent context on a single tool call.
 type RequestDetails struct {
 	RequestID       string        `json:"request_id"`
 	StartedDateTime string        `json:"started_datetime"`
 	Time            float64       `json:"time"`
 	Request         *RequestInfo  `json:"request"`
-	Response        *har.Response `json:"response"`
+	Response        *ResponseInfo `json:"response"`
 	Cache           *har.Cache    `json:"cache,omitempty"`
 	Timings         *har.Timings  `json:"timings,omitempty"`
 	ServerIPAddress string        `json:"serverIPAddress,omitempty"`
 	Connection      string        `json:"connection,omitempty"`
 	Comment         string        `json:"comment,omitempty"`
 }
+
+// ResponseInfo is like har.Response but with redacted headers and a bounded
+// body preview instead of the raw body.
+type ResponseInfo struct {
+	Status      int          `json:"status"`
+	StatusText  string       `json:"statusText"`
+	HTTPVersion string       `json:"httpVersion"`
+	Cookies     []har.Cookie `json:"cookies"`
+	Headers     []har.Header `json:"headers"`
+	Content     *ContentInfo `json:"content"`
+	RedirectURL string       `json:"redirectURL"`
+	HeadersSize int64        `json:"headersSize"`
+	BodySize    int64        `json:"bodySize"`
+}
+
+// ContentInfo is response content metadata with a bounded text preview. Binary
+// content (video, images, fonts) carries metadata only — an LLM cannot read
+// it, so shipping even a preview is token waste.
+type ContentInfo struct {
+	Size        int64  `json:"size"`
+	MimeType    string `json:"mimeType"`
+	Encoding    string `json:"encoding,omitempty"`
+	TextPreview string `json:"textPreview,omitempty"`
+	Truncated   bool   `json:"truncated,omitempty"`
+}
+
+// maxBodyPreview is the maximum number of body bytes included in a ContentInfo
+// preview. This is what keeps get_request_details bounded regardless of the
+// captured response size.
+const maxBodyPreview = 4096
 
 // RequestInfo is like har.Request but with redacted auth headers
 type RequestInfo struct {
@@ -193,12 +226,62 @@ func (p *Parser) GetRequestDetails(harData *har.HAR, requestID string) (*Request
 		StartedDateTime: entry.StartedDateTime.Format(time.RFC3339),
 		Time:            float64(entry.Time),
 		Request:         requestInfo,
-		Response:        entry.Response,
+		Response:        p.buildResponseInfo(entry.Response),
 		Cache:           entry.Cache,
 		Timings:         entry.Timings,
 	}
 
 	return details, nil
+}
+
+// buildResponseInfo converts a har.Response into a ResponseInfo with redacted
+// headers and a bounded text preview instead of the raw body.
+func (p *Parser) buildResponseInfo(resp *har.Response) *ResponseInfo {
+	if resp == nil {
+		return nil
+	}
+
+	info := &ResponseInfo{
+		Status:      resp.Status,
+		StatusText:  resp.StatusText,
+		HTTPVersion: resp.HTTPVersion,
+		Cookies:     resp.Cookies,
+		Headers:     p.redactAuthHeaders(resp.Headers),
+		RedirectURL: resp.RedirectURL,
+		HeadersSize: resp.HeadersSize,
+		BodySize:    resp.BodySize,
+	}
+
+	if resp.Content != nil {
+		info.Content = &ContentInfo{
+			Size:     resp.Content.Size,
+			MimeType: resp.Content.MimeType,
+			Encoding: resp.Content.Encoding,
+		}
+		if isTextMime(resp.Content.MimeType) && len(resp.Content.Text) > 0 {
+			preview := resp.Content.Text
+			if len(preview) > maxBodyPreview {
+				preview = preview[:maxBodyPreview]
+				info.Content.Truncated = true
+			}
+			info.Content.TextPreview = string(preview)
+		}
+	}
+
+	return info
+}
+
+// isTextMime reports whether a mime type is likely to carry LLM-readable text.
+// Binary mimes (video/*, image/*, font/*, ...) get metadata only.
+func isTextMime(mime string) bool {
+	mime = strings.ToLower(strings.SplitN(mime, ";", 2)[0])
+	return strings.HasPrefix(mime, "text/") ||
+		mime == "application/json" ||
+		mime == "application/xml" ||
+		mime == "application/javascript" ||
+		mime == "application/x-javascript" ||
+		strings.HasSuffix(mime, "+json") ||
+		strings.HasSuffix(mime, "+xml")
 }
 
 // redactAuthHeaders redacts sensitive authentication headers

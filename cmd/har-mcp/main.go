@@ -19,6 +19,13 @@ type HARServer struct {
 	harData *har.HAR
 }
 
+// maxListRows bounds list_urls_methods results so a huge capture cannot dump
+// megabytes of URLs into the agent context on one call.
+const maxListRows = 500
+
+// maxRequestIDs bounds get_request_ids results for the same reason.
+const maxRequestIDs = 2000
+
 // NewHARServer creates a new HAR MCP server
 func NewHARServer() *HARServer {
 	return &HARServer{
@@ -131,7 +138,15 @@ func (h *HARServer) handleListURLsMethods(ctx context.Context, request mcp.CallT
 	}
 
 	entries := h.parser.GetURLsAndMethods(h.harData)
-	data, err := json.MarshalIndent(entries, "", "  ")
+	total := len(entries)
+	if total > maxListRows {
+		entries = entries[:maxListRows]
+	}
+	data, err := json.MarshalIndent(struct {
+		Entries   []harParser.URLMethodEntry `json:"entries"`
+		Total     int                        `json:"total"`
+		Truncated bool                       `json:"truncated"`
+	}{Entries: entries, Total: total, Truncated: total > maxListRows}, "", "  ")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to marshal URLs and methods: %v", err)), nil
 	}
@@ -154,7 +169,15 @@ func (h *HARServer) handleGetRequestIDs(ctx context.Context, request mcp.CallToo
 	}
 
 	requestIDs := h.parser.GetRequestIDsForURLMethod(h.harData, args.URL, args.Method)
-	data, err := json.MarshalIndent(requestIDs, "", "  ")
+	total := len(requestIDs)
+	if total > maxRequestIDs {
+		requestIDs = requestIDs[:maxRequestIDs]
+	}
+	data, err := json.MarshalIndent(struct {
+		RequestIDs []string `json:"request_ids"`
+		Total      int      `json:"total"`
+		Truncated  bool     `json:"truncated"`
+	}{RequestIDs: requestIDs, Total: total, Truncated: total > maxRequestIDs}, "", "  ")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to marshal request IDs: %v", err)), nil
 	}
