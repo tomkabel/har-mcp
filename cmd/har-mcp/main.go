@@ -127,7 +127,7 @@ func (h *HARServer) createTools() []server.ServerTool {
 		{
 			Tool: mcp.Tool{
 				Name:        "get_request_details",
-				Description: "Get full request details by request ID (authentication headers and sensitive query values redacted). Text bodies up to 4KB are fully inlined in response.content.textPreview; larger bodies return the first 4KB plus a content.hash for get_response_body.",
+				Description: "Get full request details by request ID (authentication headers and sensitive query values redacted). Text bodies up to 4KB are fully inlined in response.content.textPreview; larger bodies return the first 4KB (ending with a [TRUNCATED] marker) plus a content.hash for get_response_body.",
 				InputSchema: mcp.ToolInputSchema{
 					Type: "object",
 					Properties: map[string]interface{}{

@@ -473,7 +473,10 @@ func TestGetRequestDetailsTruncatesLargeBodyPreview(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, details.Response.Content)
 	assert.True(t, details.Response.Content.Truncated)
-	assert.Equal(t, maxBodyPreview, len(details.Response.Content.TextPreview))
+	// The preview carries maxBodyPreview body bytes plus the truncation
+	// marker, which makes the break explicit instead of mid-JSON silence.
+	assert.Len(t, details.Response.Content.TextPreview, maxBodyPreview+len(truncationMarker))
+	assert.True(t, strings.HasSuffix(details.Response.Content.TextPreview, truncationMarker))
 	assert.Equal(t, int64(len(body)), details.Response.Content.Size)
 }
 
@@ -521,7 +524,8 @@ func TestGetRequestDetailsTruncatesLargePostDataPreview(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, details.Request.PostData)
 	assert.True(t, details.Request.PostData.Truncated)
-	assert.Equal(t, maxBodyPreview, len(details.Request.PostData.TextPreview))
+	assert.Len(t, details.Request.PostData.TextPreview, maxBodyPreview+len(truncationMarker))
+	assert.True(t, strings.HasSuffix(details.Request.PostData.TextPreview, truncationMarker))
 	assert.Equal(t, int64(len(body)), details.Request.PostData.Size)
 }
 
@@ -1388,9 +1392,12 @@ func TestPreviewCutAtRuneBoundary(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, details.Response.Content)
 	assert.True(t, details.Response.Content.Truncated)
-	assert.LessOrEqual(t, len(details.Response.Content.TextPreview), maxBodyPreview)
-	// The cut never splits a rune: the preview stays valid UTF-8.
-	assert.True(t, utf8.ValidString(details.Response.Content.TextPreview))
+	assert.True(t, strings.HasSuffix(details.Response.Content.TextPreview, truncationMarker))
+	// The body portion of the cut never exceeds the cap and never splits a
+	// rune: the preview minus its marker stays valid UTF-8.
+	bodyPart := strings.TrimSuffix(details.Response.Content.TextPreview, truncationMarker)
+	assert.LessOrEqual(t, len(bodyPart), maxBodyPreview)
+	assert.True(t, utf8.ValidString(bodyPart))
 }
 
 // BenchmarkParseWithBodies measures parse-time cost and allocation for a HAR

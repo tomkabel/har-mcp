@@ -453,6 +453,11 @@ type PostDataInfo struct {
 // captured response size.
 const maxBodyPreview = 4096
 
+// truncationMarker is appended to a preview that was cut at maxBodyPreview.
+// The cut can land mid-JSON, so the preview alone would look like a broken
+// document; the footer makes the break explicit and points at the fetch tool.
+const truncationMarker = "\n... [TRUNCATED — body continues past 4096 bytes; use get_response_body for the full content]"
+
 // RequestInfo is like har.Request but with redacted auth headers and a
 // bounded post-data preview instead of the raw body
 type RequestInfo struct {
@@ -540,7 +545,7 @@ func (p *Parser) buildResponseInfo(resp *har.Response) *ResponseInfo {
 		if bodyReadable(resp.Content.MimeType, resp.Content.Text) && len(resp.Content.Text) > 0 {
 			preview := string(resp.Content.Text)
 			if len(preview) > maxBodyPreview {
-				preview = cutRunes(preview, maxBodyPreview)
+				preview = cutRunes(preview, maxBodyPreview) + truncationMarker
 				info.Content.Truncated = true
 			}
 			info.Content.TextPreview = preview
@@ -572,7 +577,7 @@ func (p *Parser) buildPostDataInfo(pd *har.PostData) *PostDataInfo {
 	if bodyReadable(pd.MimeType, []byte(pd.Text)) && len(pd.Text) > 0 {
 		preview := pd.Text
 		if len(preview) > maxBodyPreview {
-			preview = cutRunes(preview, maxBodyPreview)
+			preview = cutRunes(preview, maxBodyPreview) + truncationMarker
 			info.Truncated = true
 		}
 		info.TextPreview = preview
