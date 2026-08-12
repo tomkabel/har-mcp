@@ -19,10 +19,6 @@ type HARServer struct {
 	harData *har.HAR
 }
 
-// maxListRows bounds list_urls_methods results so a huge capture cannot dump
-// megabytes of URLs into the agent context on one call.
-const maxListRows = 500
-
 // maxRequestIDs bounds get_request_ids results for the same reason.
 const maxRequestIDs = 2000
 
@@ -65,14 +61,31 @@ func (h *HARServer) createTools() []server.ServerTool {
 		},
 		{
 			Tool: mcp.Tool{
-				Name:        "list_urls_methods",
-				Description: "List all accessed URLs and their HTTP methods from the loaded HAR file",
+				Name:        "list_entries",
+				Description: "List all HAR entries as one compact row each — method, status, mime type, size, timing, and body hash. Query params are stripped from URLs; use get_request_details for the full URL. This is the primary index: call this first, then get_request_details, then get_response_body.",
 				InputSchema: mcp.ToolInputSchema{
-					Type:       "object",
-					Properties: map[string]interface{}{},
+					Type: "object",
+					Properties: map[string]interface{}{
+						"filter": map[string]interface{}{
+							"type":        "string",
+							"description": "Substring match on the request URL path (query params are stripped from displayed URLs)",
+						},
+						"method": map[string]interface{}{
+							"type":        "string",
+							"description": "The HTTP method to filter by (GET, POST, etc.)",
+						},
+						"offset": map[string]interface{}{
+							"type":        "number",
+							"description": "Row offset into the matching entries (default 0)",
+						},
+						"limit": map[string]interface{}{
+							"type":        "number",
+							"description": "Maximum number of rows to return (default 200, max 1000)",
+						},
+					},
 				},
 			},
-			Handler: h.handleListURLsMethods,
+			Handler: h.handleListEntries,
 		},
 		{
 			Tool: mcp.Tool{
@@ -156,24 +169,43 @@ func (h *HARServer) handleLoadHAR(ctx context.Context, request mcp.CallToolReque
 	return mcp.NewToolResultText(fmt.Sprintf("Successfully loaded HAR file with %d entries", len(h.harData.Log.Entries))), nil
 }
 
-// handleListURLsMethods handles the list_urls_methods tool call
-func (h *HARServer) handleListURLsMethods(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+// handleListEntries handles the list_entries tool call
+func (h *HARServer) handleListEntries(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if h.harData == nil {
 		return mcp.NewToolResultError("No HAR file loaded. Please load a HAR file first using load_har."), nil
 	}
 
-	entries := h.parser.GetURLsAndMethods(h.harData)
-	total := len(entries)
-	if total > maxListRows {
-		entries = entries[:maxListRows]
+	var args struct {
+		Filter string `json:"filter"`
+		Method string `json:"method"`
+		Offset int    `json:"offset"`
+		Limit  int    `json:"limit"`
 	}
+	if err := request.BindArguments(&args); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Invalid arguments: %v", err)), nil
+	}
+	// Clamp here too so the echoed offset/limit and truncated math match the
+	// page GetEntries actually returned.
+	if args.Offset < 0 {
+		args.Offset = 0
+	}
+	if args.Limit <= 0 {
+		args.Limit = 200
+	}
+	if args.Limit > 1000 {
+		args.Limit = 1000
+	}
+
+	entries, total := h.parser.GetEntries(h.harData, args.Filter, args.Method, args.Offset, args.Limit)
 	data, err := json.MarshalIndent(struct {
-		Entries   []harParser.URLMethodEntry `json:"entries"`
-		Total     int                        `json:"total"`
-		Truncated bool                       `json:"truncated"`
-	}{Entries: entries, Total: total, Truncated: total > maxListRows}, "", "  ")
+		Entries   []harParser.EntrySummary `json:"entries"`
+		Total     int                      `json:"total"`
+		Offset    int                      `json:"offset"`
+		Limit     int                      `json:"limit"`
+		Truncated bool                     `json:"truncated"`
+	}{Entries: entries, Total: total, Offset: args.Offset, Limit: args.Limit, Truncated: args.Offset+len(entries) < total}, "", "  ")
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to marshal URLs and methods: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to marshal entries: %v", err)), nil
 	}
 
 	return mcp.NewToolResultText(string(data)), nil

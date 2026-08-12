@@ -5,7 +5,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) s
 ## Features
 
 - **Load HAR files** from local filesystem or HTTP URLs
-- **List all URLs and HTTP methods** accessed in the HAR file
+- **List all entries** as one compact row each (method, status, mime type, size, timing, body hash), with substring filtering and pagination
 - **Query request IDs** for specific URL and method combinations
 - **Retrieve full request details** with automatic redaction of authentication headers
 - **Flexible HAR parsing** that handles real-world HAR files with:
@@ -102,12 +102,19 @@ Load a HAR file from a file path or HTTP URL.
 }
 ```
 
-#### 2. `list_urls_methods`
-List all accessed URLs and their HTTP methods from the loaded HAR file.
+#### 2. `list_entries`
+List all HAR entries as one compact row each — method, status, mime type, size,
+timing, and body hash. Query params are stripped from URLs; use
+`get_request_details` for the full URL. This is the primary index: call this
+first, then `get_request_details`, then `get_response_body`.
 
-**Parameters:** None
+**Parameters:**
+- `filter` (string, optional): Substring match on the request URL path (query params are stripped from displayed URLs)
+- `method` (string, optional): The HTTP method to filter by (GET, POST, etc.)
+- `offset` (number, optional, default 0): Row offset into the matching entries
+- `limit` (number, optional, default 200, max 1000): Maximum number of rows to return
 
-**Returns:** Array of URL/method combinations with their associated request IDs.
+**Returns:** `{entries, total, offset, limit, truncated}` — one flat row per entry.
 
 #### 3. `get_request_ids`
 Get all request IDs for a specific URL and HTTP method.

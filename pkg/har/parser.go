@@ -154,6 +154,91 @@ func (p *Parser) GetRequestIDsForURLMethod(harData *har.HAR, targetURL, method s
 	return requestIDs
 }
 
+// EntrySummary is one compact row per HAR entry: the whole-file index view
+// the agent sees in a single list_entries call. Deliberately flat and
+// minimal — no headers, no startedDateTime (get_request_details has the full
+// picture). URL has query params and fragment stripped.
+type EntrySummary struct {
+	RequestID string  `json:"requestId"` // positional "request_%d"
+	Method    string  `json:"method"`
+	URL       string  `json:"url"`    // query params STRIPPED
+	Status    int     `json:"status"` // 0 when no response
+	MimeType  string  `json:"mimeType,omitempty"`
+	Size      int64   `json:"size,omitempty"` // decoded response body size
+	TimeMs    float64 `json:"timeMs"`
+	BodyHash  string  `json:"bodyHash,omitempty"` // body store ref, when a body was indexed
+}
+
+// GetEntries returns a page of compact per-entry rows in file order plus the
+// total number of matching entries before pagination. filter is a
+// case-insensitive substring match on the query-stripped URL; method is an
+// exact match; either filter is ignored when empty. Entries with a nil
+// Request are skipped and do not count toward total. offset clamps to 0;
+// limit defaults to 200 and caps at 1000. The returned page starts at
+// offset and may be shorter than limit at the end of the match set.
+func (p *Parser) GetEntries(harData *har.HAR, filter, method string, offset, limit int) ([]EntrySummary, int) {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	var matches []EntrySummary
+	for i, entry := range harData.Log.Entries {
+		if entry.Request == nil {
+			continue
+		}
+		url := stripQuery(entry.Request.URL)
+		if filter != "" && !strings.Contains(strings.ToLower(url), strings.ToLower(filter)) {
+			continue
+		}
+		if method != "" && entry.Request.Method != method {
+			continue
+		}
+		row := EntrySummary{
+			RequestID: fmt.Sprintf("request_%d", i),
+			Method:    entry.Request.Method,
+			URL:       url,
+			TimeMs:    float64(entry.Time),
+		}
+		if entry.Response != nil {
+			row.Status = entry.Response.Status
+			if entry.Response.Content != nil {
+				row.MimeType = entry.Response.Content.MimeType
+				row.Size = entry.Response.Content.Size
+				// Add is idempotent: bodies were already indexed at parse time.
+				row.BodyHash = p.bodies.Add(entry.Response.Content.Text, entry.Response.Content.MimeType)
+			}
+		}
+		matches = append(matches, row)
+	}
+
+	end := offset + limit
+	if end > len(matches) {
+		end = len(matches)
+	}
+	if offset > end {
+		offset = end
+	}
+	return matches[offset:end], len(matches)
+}
+
+// stripQuery removes the query string and fragment from a URL for compact
+// index rows. On parse error the raw URL is returned unchanged.
+func stripQuery(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
 // RequestDetails represents the full details of a request with auth headers
 // redacted and response bodies bounded to a preview. Raw bodies are never
 // included: a huge response (e.g. a base64 mp4) would otherwise dump hundreds

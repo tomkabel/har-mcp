@@ -905,3 +905,76 @@ func TestGetResponseBodyUnknownHash(t *testing.T) {
 	assert.Nil(t, chunk)
 	assert.Contains(t, err.Error(), "unknown body hash")
 }
+
+// GetEntries tests
+
+func TestGetEntriesStripsQueryParams(t *testing.T) {
+	harData := `{
+		"log": {
+			"version": "1.2",
+			"creator": {"name": "test-creator", "version": "1.0"},
+			"entries": [
+				{
+					"startedDateTime": "2023-01-01T00:00:00.000Z",
+					"time": 100,
+					"request": {"method": "GET", "url": "https://example.com/_next/static/chunks/4051.8ef8f2c36aab35cf.js?dpl=dpl_3Jw8vhcQQWEZCvVexEep", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "queryString": [], "headersSize": 150, "bodySize": 0},
+					"response": {"status": 200, "statusText": "OK", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [], "content": {"size": 11, "mimeType": "application/javascript"}, "redirectURL": "", "headersSize": 200, "bodySize": 11}
+				}
+			]
+		}
+	}`
+	archive := parseTestHAR(t, harData)
+
+	entries, total := NewParser().GetEntries(archive, "", "", 0, 10)
+
+	assert.Equal(t, 1, total)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "https://example.com/_next/static/chunks/4051.8ef8f2c36aab35cf.js", entries[0].URL)
+	assert.NotContains(t, entries[0].URL, "dpl=")
+}
+
+func TestGetEntriesFilterIsCaseInsensitiveSubstring(t *testing.T) {
+	archive := parseTestHAR(t, createMultipleEntriesHAR())
+
+	// Uppercase filter matches lowercase URLs.
+	entries, total := NewParser().GetEntries(archive, "API/USERS", "", 0, 10)
+	assert.Equal(t, 3, total)
+	require.Len(t, entries, 3)
+
+	// A filter containing stripped query text matches nothing.
+	entries, total = NewParser().GetEntries(archive, "users?x", "", 0, 10)
+	assert.Equal(t, 0, total)
+	assert.Empty(t, entries)
+}
+
+func TestGetEntriesPagination(t *testing.T) {
+	archive := parseTestHAR(t, createMultipleEntriesHAR())
+
+	entries, total := NewParser().GetEntries(archive, "", "", 0, 2)
+	assert.Equal(t, 3, total)
+	require.Len(t, entries, 2)
+	assert.Equal(t, "request_0", entries[0].RequestID)
+	assert.Equal(t, "request_1", entries[1].RequestID)
+
+	// A page starting near the end is shorter than the limit.
+	entries, total = NewParser().GetEntries(archive, "", "", 2, 2)
+	assert.Equal(t, 3, total)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "request_2", entries[0].RequestID)
+}
+
+func TestGetEntriesIncludesBodyHash(t *testing.T) {
+	parser := NewParser()
+	body := `{"ok": true}`
+	archive := createResponseHARWithParser(t, parser, nil, "application/json", body)
+
+	entries, total := parser.GetEntries(archive, "", "", 0, 10)
+
+	assert.Equal(t, 1, total)
+	require.Len(t, entries, 1)
+	sum := sha256.Sum256([]byte(body))
+	assert.Equal(t, fmt.Sprintf("body:%x", sum[:8]), entries[0].BodyHash)
+	assert.Equal(t, 200, entries[0].Status)
+	assert.Equal(t, "application/json", entries[0].MimeType)
+	assert.Equal(t, int64(len(body)), entries[0].Size)
+}
