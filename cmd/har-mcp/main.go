@@ -29,9 +29,10 @@ func NewHARServer() *HARServer {
 	}
 }
 
-// loadHAR loads a HAR file from the given source
-func (h *HARServer) loadHAR(source string) error {
-	harData, err := h.parser.ParseSource(source)
+// loadHAR loads a HAR file from the given source, optionally applying a
+// load policy that keeps excluded bodies out of the body store.
+func (h *HARServer) loadHAR(source string, policy *harParser.LoadPolicy) error {
+	harData, err := h.parser.ParseSourceWithPolicy(source, policy)
 	if err != nil {
 		return fmt.Errorf("failed to load HAR: %w", err)
 	}
@@ -45,13 +46,28 @@ func (h *HARServer) createTools() []server.ServerTool {
 		{
 			Tool: mcp.Tool{
 				Name:        "load_har",
-				Description: "Load a HAR file from a file path or HTTP URL",
+				Description: "Load a HAR file from a file path or HTTP URL. The optional policy keeps matching bodies out of the body store: excluded bodies still appear in details but get no hash and cannot be fetched with get_response_body.",
 				InputSchema: mcp.ToolInputSchema{
 					Type: "object",
 					Properties: map[string]interface{}{
 						"source": map[string]interface{}{
 							"type":        "string",
 							"description": "File path or HTTP URL to the HAR file",
+						},
+						"policy": map[string]interface{}{
+							"type":        "object",
+							"description": "Optional load policy: bodies matching an excluded mime prefix or larger than maxKeepBytes are not stored",
+							"properties": map[string]interface{}{
+								"excludeMimeTypes": map[string]interface{}{
+									"type":        "array",
+									"items":       map[string]interface{}{"type": "string"},
+									"description": "Mime type prefixes to exclude, case-insensitive (e.g. \"video/\", \"image/*\")",
+								},
+								"maxKeepBytes": map[string]interface{}{
+									"type":        "number",
+									"description": "Bodies larger than this many bytes are not stored (absent or <= 0: no limit)",
+								},
+							},
 						},
 					},
 					Required: []string{"source"},
@@ -156,13 +172,14 @@ func (h *HARServer) createTools() []server.ServerTool {
 // handleLoadHAR handles the load_har tool call
 func (h *HARServer) handleLoadHAR(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var args struct {
-		Source string `json:"source"`
+		Source string                `json:"source"`
+		Policy *harParser.LoadPolicy `json:"policy"`
 	}
 	if err := request.BindArguments(&args); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Invalid arguments: %v", err)), nil
 	}
 
-	if err := h.loadHAR(args.Source); err != nil {
+	if err := h.loadHAR(args.Source, args.Policy); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Error loading HAR file: %v", err)), nil
 	}
 

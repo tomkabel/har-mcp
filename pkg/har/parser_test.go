@@ -334,6 +334,14 @@ func createResponseHAR(t *testing.T, headers []har.Header, mimeType, body string
 // parser, so the body lands in that parser's body store at parse time.
 func createResponseHARWithParser(t *testing.T, parser *Parser, headers []har.Header, mimeType, body string) *har.HAR {
 	t.Helper()
+	return createResponseHARWithPolicy(t, parser, nil, headers, mimeType, body)
+}
+
+// createResponseHARWithPolicy is createResponseHARWithParser but parsed with
+// the given load policy, so the policy governs which bodies land in the
+// parser's body store.
+func createResponseHARWithPolicy(t *testing.T, parser *Parser, policy *LoadPolicy, headers []har.Header, mimeType, body string) *har.HAR {
+	t.Helper()
 
 	headerJSON, err := json.Marshal(headers)
 	require.NoError(t, err, "failed to marshal test headers")
@@ -376,7 +384,7 @@ func createResponseHARWithParser(t *testing.T, parser *Parser, headers []har.Hea
 		}
 	}`, string(headerJSON), len(body), mimeType, base64.StdEncoding.EncodeToString([]byte(body)), len(body))
 
-	archive, err := parser.Parse(strings.NewReader(harData))
+	archive, err := parser.ParseWithPolicy(strings.NewReader(harData), policy)
 	require.NoError(t, err, "failed to parse test HAR data")
 	require.NotNil(t, archive, "parsed archive should not be nil")
 
@@ -977,4 +985,76 @@ func TestGetEntriesIncludesBodyHash(t *testing.T) {
 	assert.Equal(t, 200, entries[0].Status)
 	assert.Equal(t, "application/json", entries[0].MimeType)
 	assert.Equal(t, int64(len(body)), entries[0].Size)
+}
+
+// Load policy tests
+
+func TestLoadPolicyExcludedMimeNotStored(t *testing.T) {
+	parser := NewParser()
+	policy := &LoadPolicy{ExcludeMimeTypes: []string{"video/", "image/*"}}
+	body := "fake mp4 bytes"
+	archive := createResponseHARWithPolicy(t, parser, policy, nil, "video/mp4", body)
+
+	details, err := parser.GetRequestDetails(archive, "request_0")
+	require.NoError(t, err)
+	require.NotNil(t, details.Response.Content)
+	assert.Empty(t, details.Response.Content.Hash)
+
+	sum := sha256.Sum256([]byte(body))
+	ref := fmt.Sprintf("body:%x", sum[:8])
+	chunk, err := parser.GetResponseBody(ref, 0, 4096)
+	assert.EqualError(t, err, "unknown body hash: "+ref)
+	assert.Nil(t, chunk)
+}
+
+func TestLoadPolicyMaxKeepBytesNotStored(t *testing.T) {
+	parser := NewParser()
+	policy := &LoadPolicy{MaxKeepBytes: 100}
+
+	big := strings.Repeat("x", 200)
+	bigArchive := createResponseHARWithPolicy(t, parser, policy, nil, "text/plain", big)
+	bigDetails, err := parser.GetRequestDetails(bigArchive, "request_0")
+	require.NoError(t, err)
+	require.NotNil(t, bigDetails.Response.Content)
+	assert.Empty(t, bigDetails.Response.Content.Hash)
+	bigSum := sha256.Sum256([]byte(big))
+	bigRef := fmt.Sprintf("body:%x", bigSum[:8])
+	_, err = parser.GetResponseBody(bigRef, 0, 4096)
+	assert.EqualError(t, err, "unknown body hash: "+bigRef)
+
+	small := "small body"
+	smallArchive := createResponseHARWithPolicy(t, parser, policy, nil, "text/plain", small)
+	smallDetails, err := parser.GetRequestDetails(smallArchive, "request_0")
+	require.NoError(t, err)
+	require.NotNil(t, smallDetails.Response.Content)
+	require.NotEmpty(t, smallDetails.Response.Content.Hash)
+	chunk, err := parser.GetResponseBody(smallDetails.Response.Content.Hash, 0, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, small, chunk.Text)
+}
+
+func TestParseReplacesBodyStore(t *testing.T) {
+	parser := NewParser()
+
+	first := createResponseHARWithParser(t, parser, nil, "text/plain", "first body")
+	firstDetails, err := parser.GetRequestDetails(first, "request_0")
+	require.NoError(t, err)
+	require.NotNil(t, firstDetails.Response.Content)
+	require.NotEmpty(t, firstDetails.Response.Content.Hash)
+
+	second := createResponseHARWithParser(t, parser, nil, "text/plain", "second body")
+	secondDetails, err := parser.GetRequestDetails(second, "request_0")
+	require.NoError(t, err)
+	require.NotNil(t, secondDetails.Response.Content)
+	require.NotEmpty(t, secondDetails.Response.Content.Hash)
+	assert.NotEqual(t, firstDetails.Response.Content.Hash, secondDetails.Response.Content.Hash)
+
+	// The first load's body is gone after the re-load...
+	_, err = parser.GetResponseBody(firstDetails.Response.Content.Hash, 0, 4096)
+	assert.EqualError(t, err, "unknown body hash: "+firstDetails.Response.Content.Hash)
+
+	// ...while the second load's body is fetchable.
+	chunk, err := parser.GetResponseBody(secondDetails.Response.Content.Hash, 0, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, "second body", chunk.Text)
 }

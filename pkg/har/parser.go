@@ -17,9 +17,11 @@ import (
 
 // Parser handles HAR file parsing from various sources. It holds the body
 // store populated at parse time, so decoded response bodies can be fetched
-// later by content hash.
+// later by content hash, and the load policy that governed the most recent
+// parse, so reads after the load apply the same exclusion decisions.
 type Parser struct {
 	bodies *BodyStore
+	policy *LoadPolicy // set on each successful parse, alongside the store reset
 }
 
 // NewParser creates a new HAR parser
@@ -27,19 +29,69 @@ func NewParser() *Parser {
 	return &Parser{bodies: NewBodyStore()}
 }
 
+// LoadPolicy controls which response bodies are stored at parse time.
+// Bodies whose mime type matches an excluded prefix, or whose decoded size
+// exceeds MaxKeepBytes, are NOT stored in the body store: they remain in the
+// parsed HAR (details previews still work from the in-memory HAR) but get no
+// body hash, so get_response_body cannot fetch them. MaxKeepBytes <= 0 means
+// no size limit. Mime matching is a case-insensitive prefix match on the mime
+// type before any ';' parameter, e.g. "video/" or "image/*" both match
+// "video/mp4" / "image/jpeg".
+type LoadPolicy struct {
+	// ExcludeMimeTypes lists mime type prefixes whose bodies are not stored.
+	ExcludeMimeTypes []string `json:"excludeMimeTypes,omitempty"`
+	// MaxKeepBytes is the maximum decoded body size to store; larger bodies
+	// are not stored. <= 0 means no limit.
+	MaxKeepBytes int64 `json:"maxKeepBytes,omitempty"`
+}
+
+// excludes reports whether a body with the given mime type and decoded size
+// is filtered out by the policy.
+func (p *LoadPolicy) excludes(mimeType string, size int64) bool {
+	if p.MaxKeepBytes > 0 && size > p.MaxKeepBytes {
+		return true
+	}
+	mimeType = strings.ToLower(strings.SplitN(mimeType, ";", 2)[0])
+	for _, pattern := range p.ExcludeMimeTypes {
+		// "image/*" and "image/" are the same prefix.
+		if strings.HasPrefix(mimeType, strings.ToLower(strings.TrimSuffix(pattern, "*"))) {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldStore reports whether a body should enter the body store under the
+// current load policy. A nil policy stores everything.
+func (p *Parser) shouldStore(mimeType string, size int64) bool {
+	return p.policy == nil || !p.policy.excludes(mimeType, size)
+}
+
 // ParseFromFile parses a HAR file from disk
 func (p *Parser) ParseFromFile(path string) (*har.HAR, error) {
+	return p.ParseFromFileWithPolicy(path, nil)
+}
+
+// ParseFromFileWithPolicy is ParseFromFile with a load policy applied at
+// index time.
+func (p *Parser) ParseFromFileWithPolicy(path string, policy *LoadPolicy) (*har.HAR, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open HAR file: %w", err)
 	}
 	defer file.Close() //nolint:errcheck
 
-	return p.Parse(file)
+	return p.ParseWithPolicy(file, policy)
 }
 
 // ParseFromURL parses a HAR file from an HTTP URL
 func (p *Parser) ParseFromURL(harURL string) (*har.HAR, error) {
+	return p.ParseFromURLWithPolicy(harURL, nil)
+}
+
+// ParseFromURLWithPolicy is ParseFromURL with a load policy applied at index
+// time.
+func (p *Parser) ParseFromURLWithPolicy(harURL string, policy *LoadPolicy) (*har.HAR, error) {
 	resp, err := http.Get(harURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch HAR from URL: %w", err)
@@ -50,11 +102,17 @@ func (p *Parser) ParseFromURL(harURL string) (*har.HAR, error) {
 		return nil, fmt.Errorf("failed to fetch HAR: HTTP %d", resp.StatusCode)
 	}
 
-	return p.Parse(resp.Body)
+	return p.ParseWithPolicy(resp.Body, policy)
 }
 
 // Parse parses a HAR file from the given reader
 func (p *Parser) Parse(r io.Reader) (*har.HAR, error) {
+	return p.ParseWithPolicy(r, nil)
+}
+
+// ParseWithPolicy parses a HAR file from the given reader, applying the load
+// policy when indexing response bodies.
+func (p *Parser) ParseWithPolicy(r io.Reader, policy *LoadPolicy) (*har.HAR, error) {
 	// Read all data so we can try multiple parsing approaches
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -65,7 +123,11 @@ func (p *Parser) Parse(r io.Reader) (*har.HAR, error) {
 	var harData har.HAR
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(&harData); err == nil {
-		// Standard parsing succeeded
+		// Standard parsing succeeded. The new load replaces the previous
+		// one: reset policy and body store so the old HAR's bodies are no
+		// longer fetchable.
+		p.policy = policy
+		p.bodies = NewBodyStore()
 		p.indexResponseBodies(&harData)
 		return &harData, nil
 	}
@@ -79,17 +141,22 @@ func (p *Parser) Parse(r io.Reader) (*har.HAR, error) {
 
 	// Convert flexible HAR to standard HAR
 	standardHAR := flexibleHAR.ToStandardHAR()
+	p.policy = policy
+	p.bodies = NewBodyStore()
 	p.indexResponseBodies(standardHAR)
 	return standardHAR, nil
 }
 
-// indexResponseBodies stores every non-empty decoded response body in the
-// body store, deduplicated by content hash. This is the single choke point
-// where bodies enter the store, covering both the standard decode and the
-// FlexibleHAR fallback.
+// indexResponseBodies stores every non-empty decoded response body allowed
+// by the load policy in the body store, deduplicated by content hash. This
+// is the single choke point where bodies enter the store at parse time,
+// covering both the standard decode and the FlexibleHAR fallback.
 func (p *Parser) indexResponseBodies(harData *har.HAR) {
 	for _, entry := range harData.Log.Entries {
 		if entry.Response == nil || entry.Response.Content == nil {
+			continue
+		}
+		if !p.shouldStore(entry.Response.Content.MimeType, int64(len(entry.Response.Content.Text))) {
 			continue
 		}
 		p.bodies.Add(entry.Response.Content.Text, entry.Response.Content.MimeType)
@@ -210,8 +277,12 @@ func (p *Parser) GetEntries(harData *har.HAR, filter, method string, offset, lim
 			if entry.Response.Content != nil {
 				row.MimeType = entry.Response.Content.MimeType
 				row.Size = entry.Response.Content.Size
-				// Add is idempotent: bodies were already indexed at parse time.
-				row.BodyHash = p.bodies.Add(entry.Response.Content.Text, entry.Response.Content.MimeType)
+				// Add is idempotent: bodies were already indexed at parse
+				// time. Bodies the load policy excluded must not sneak in
+				// through a read, so the same policy check applies here.
+				if p.shouldStore(entry.Response.Content.MimeType, int64(len(entry.Response.Content.Text))) {
+					row.BodyHash = p.bodies.Add(entry.Response.Content.Text, entry.Response.Content.MimeType)
+				}
 			}
 		}
 		matches = append(matches, row)
@@ -364,9 +435,12 @@ func (p *Parser) buildResponseInfo(resp *har.Response) *ResponseInfo {
 			Size:     resp.Content.Size,
 			MimeType: resp.Content.MimeType,
 			Encoding: resp.Content.Encoding,
-			// Add is idempotent: bodies already indexed at parse time are
-			// returned by reference without re-storing.
-			Hash: p.bodies.Add(resp.Content.Text, resp.Content.MimeType),
+		}
+		// Add is idempotent: bodies already indexed at parse time are
+		// returned by reference without re-storing. Bodies the load policy
+		// excluded get no hash, so get_response_body cannot fetch them.
+		if p.shouldStore(resp.Content.MimeType, int64(len(resp.Content.Text))) {
+			info.Content.Hash = p.bodies.Add(resp.Content.Text, resp.Content.MimeType)
 		}
 		if isTextMime(resp.Content.MimeType) && len(resp.Content.Text) > 0 {
 			preview := resp.Content.Text
@@ -422,13 +496,19 @@ func (p *Parser) redactAuthHeaders(headers []har.Header) []har.Header {
 
 // ParseSource parses a HAR file from either a file path or URL
 func (p *Parser) ParseSource(source string) (*har.HAR, error) {
+	return p.ParseSourceWithPolicy(source, nil)
+}
+
+// ParseSourceWithPolicy is ParseSource with a load policy applied at index
+// time.
+func (p *Parser) ParseSourceWithPolicy(source string, policy *LoadPolicy) (*har.HAR, error) {
 	// Check if it's a URL
 	if u, err := url.Parse(source); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return p.ParseFromURL(source)
+		return p.ParseFromURLWithPolicy(source, policy)
 	}
 
 	// Otherwise treat as file path
-	return p.ParseFromFile(source)
+	return p.ParseFromFileWithPolicy(source, policy)
 }
 
 // BodyChunk is a bounded slice of a stored response body. Text bodies carry

@@ -94,11 +94,23 @@ Load a HAR file from a file path or HTTP URL.
 
 **Parameters:**
 - `source` (string, required): File path or HTTP URL to the HAR file
+- `policy` (object, optional): keeps matching response bodies out of the
+  body store at load time. Bodies affected by the policy still appear in
+  `get_request_details` (with previews) but get no `hash` and cannot be
+  fetched via `get_response_body`:
+  - `excludeMimeTypes` (string[], optional): mime type prefixes to exclude,
+    case-insensitive (e.g. `"video/"`, `"image/*"`)
+  - `maxKeepBytes` (number, optional): bodies larger than this many bytes
+    are not stored (absent or `<= 0`: no limit)
 
 **Example:**
 ```json
 {
-  "source": "/path/to/capture.har"
+  "source": "/path/to/capture.har",
+  "policy": {
+    "excludeMimeTypes": ["video/", "image/*"],
+    "maxKeepBytes": 1048576
+  }
 }
 ```
 
