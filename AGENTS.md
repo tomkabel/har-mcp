@@ -48,8 +48,15 @@ push to `main` or `v*` tags. Dockerfile is multi-stage, `CGO_ENABLED=0`, alpine 
   `mcp.NewToolResultError(...)` with a `nil` error.
 - Tool outputs are CONTEXT-BOUNDED — this is load-bearing, do not bypass it: response
   bodies and request postData are stored in the `BodyStore` at parse time and never
-  serialized raw. Details calls return at most a 4KB `textPreview` plus a
-  `body:<16 hex>` content hash; `get_response_body` fetches the full body in chunks.
+  serialized raw. Details calls return at most a 4KB `textPreview` (bodies ≤4KB are
+  fully inlined; larger ones are cut at a rune boundary, never mid-rune) plus a
+  `body:<64 hex sha256>` content hash; `get_response_body` fetches the full body in
+  chunks. `list_entries` URLs keep query params — they discriminate requests — capped
+  at 100 chars; sensitive query values are redacted.
+- Preview textability falls back to a UTF-8 content sniff (`looksLikeText`) when the
+  declared mime type is missing or wrong (e.g. JSON served as
+  `application/octet-stream`); bodies that fail both the mime allowlist and the sniff
+  are metadata-only. The sniff is a heuristic, not a verdict.
 - `Parser` holds the `BodyStore` and the `LoadPolicy` of the most recent parse (it is
   NOT stateless); query methods take `*har.HAR` as an argument. `HARServer` in main.go
   holds the loaded `*har.HAR` state.
@@ -66,7 +73,12 @@ push to `main` or `v*` tags. Dockerfile is multi-stage, `CGO_ENABLED=0`, alpine 
   every ID. `GetEntries`/`GetURLsAndMethods` skip entries with nil `Request` but still
   count their index, so IDs can skip.
 - Redaction covers BOTH request and response headers in `get_request_details`
-  (`redactAuthHeaders`). `Set-Cookie` on responses is redacted.
+  (`redactAuthHeaders`). `Set-Cookie` on responses is redacted. Sensitive QUERY
+  values (token, api_key, session, ...) are redacted too — in index URLs, details
+  URLs, and `queryString` — and URL matching (`list_entries` filter,
+  `get_request_ids`) runs on the normalized, redacted form so displayed URLs
+  round-trip. Redaction is name-list based; body VALUES are not redacted (response
+  bodies are hash-gated behind `get_response_body`).
 - The server is stdio-only JSON-RPC: running `./har-mcp` bare just blocks on stdin
   (normal MCP behavior). There are no flags, no HTTP mode. Manual testing requires an MCP
   client, or exercise the parser via `go test ./...` / a tiny Go program.
