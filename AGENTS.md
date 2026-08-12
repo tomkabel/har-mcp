@@ -49,8 +49,9 @@ push to `main` or `v*` tags. Dockerfile is multi-stage, `CGO_ENABLED=0`, alpine 
 - Tool outputs are CONTEXT-BOUNDED — this is load-bearing, do not bypass it: response
   bodies and request postData are stored in the `BodyStore` at parse time and never
   serialized raw. Details calls return at most a 4KB `textPreview` (bodies ≤4KB are
-  fully inlined; larger ones are cut at a rune boundary, never mid-rune) plus a
-  `body:<64 hex sha256>` content hash; `get_response_body` fetches the full body in
+  fully inlined; larger ones are cut at a rune boundary, never mid-rune, and end with
+  a `[TRUNCATED]` marker so the cut reads as intentional rather than broken JSON) plus
+  a `body:<64 hex sha256>` content hash; `get_response_body` fetches the full body in
   chunks. `list_entries` URLs keep query params — they discriminate requests — capped
   at 100 chars; sensitive query values are redacted.
 - Preview textability falls back to a UTF-8 content sniff (`looksLikeText`) when the
